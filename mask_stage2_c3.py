@@ -45,6 +45,7 @@ def parse_xml(xml_path):
         roi_list = []
         for roi in nodule.findall(".//ns:roi", ns):
             z_elem = roi.find("ns:imageZposition", ns)
+            sop_elem = roi.find("ns:imageSOP_UID", ns)
             if z_elem is None or z_elem.text is None:
                 continue
 
@@ -60,6 +61,7 @@ def parse_xml(xml_path):
                 roi_list.append(
                     {
                         "z": float(z_elem.text),
+                        "sop_uid": sop_elem.text.strip() if sop_elem is not None and sop_elem.text else "",
                         "x": np.asarray(xs, dtype=np.float32),
                         "y": np.asarray(ys, dtype=np.float32),
                     }
@@ -71,6 +73,7 @@ def parse_xml(xml_path):
     for small_tag in ("nonNodule", "smallNodule"):
         for item in root.findall(f".//ns:{small_tag}", ns):
             z_elem = item.find("ns:imageZposition", ns)
+            sop_elem = item.find("ns:imageSOP_UID", ns)
             x_elem = item.find("ns:locus/ns:xCoord", ns)
             y_elem = item.find("ns:locus/ns:yCoord", ns)
             if x_elem is None:
@@ -88,6 +91,7 @@ def parse_xml(xml_path):
                 small_points.append(
                     {
                         "z": float(z_elem.text),
+                        "sop_uid": sop_elem.text.strip() if sop_elem is not None and sop_elem.text else "",
                         "x": float(x_elem.text),
                         "y": float(y_elem.text),
                         "source": small_tag,
@@ -95,6 +99,18 @@ def parse_xml(xml_path):
                 )
 
     return {"series_uid": series_uid, "nodules": nodules, "small_points": small_points}
+
+
+def collect_xml_sop_uids(parsed):
+    sop_uids = set()
+    for nodule in parsed["nodules"]:
+        for roi in nodule:
+            if roi.get("sop_uid"):
+                sop_uids.add(roi["sop_uid"])
+    for point in parsed["small_points"]:
+        if point.get("sop_uid"):
+            sop_uids.add(point["sop_uid"])
+    return sop_uids
 
 
 def read_dicom_header(path):
@@ -119,7 +135,34 @@ def collect_ct_dicoms(patient_dir):
     return series_map
 
 
-def choose_series_uid(series_map, target_uid=None):
+def count_sop_uid_matches(series_paths, target_sop_uids):
+    if not target_sop_uids:
+        return 0
+    matches = 0
+    for path in series_paths:
+        ds = read_dicom_header(path)
+        if ds is None:
+            continue
+        if str(getattr(ds, "SOPInstanceUID", "")) in target_sop_uids:
+            matches += 1
+    return matches
+
+
+def choose_series_uid(series_map, target_uid=None, target_sop_uids=None):
+    if target_sop_uids:
+        scored = []
+        for uid, paths in series_map.items():
+            scored.append((count_sop_uid_matches(paths, target_sop_uids), uid))
+        scored.sort(reverse=True)
+        best_score, best_uid = scored[0]
+        if best_score > 0:
+            if target_uid and target_uid in series_map and target_uid != best_uid:
+                print(
+                    f"[WARN] XML series UID differs from SOP-matched CT series | "
+                    f"xml_series={target_uid} | sop_matched_series={best_uid} | matched_slices={best_score}"
+                )
+            return best_uid
+
     if target_uid and target_uid in series_map:
         return target_uid
     if target_uid:
@@ -248,11 +291,32 @@ def find_slice_index_for_xml_z(xml_z, slices):
     return idx
 
 
-def rasterize_nodule_mask(image_shape, nodules, slices):
+def build_sop_index(slices):
+    sop_index = {}
+    for idx, ds in enumerate(slices):
+        sop_uid = str(getattr(ds, "SOPInstanceUID", ""))
+        if sop_uid:
+            sop_index[sop_uid] = idx
+    return sop_index
+
+
+def find_slice_index_for_annotation(annotation, slices, sop_index):
+    sop_uid = annotation.get("sop_uid", "")
+    if sop_uid:
+        if sop_uid in sop_index:
+            return sop_index[sop_uid]
+        print(
+            f"[WARN] XML SOP UID not found in selected DICOM series; falling back to z | "
+            f"sop_uid={sop_uid}"
+        )
+    return find_slice_index_for_xml_z(annotation["z"], slices)
+
+
+def rasterize_nodule_mask(image_shape, nodules, slices, sop_index):
     mask = np.zeros(image_shape, dtype=np.uint8)
     for nodule in nodules:
         for roi in nodule:
-            z_idx = find_slice_index_for_xml_z(roi["z"], slices)
+            z_idx = find_slice_index_for_annotation(roi, slices, sop_index)
 
             col = np.round(roi["x"]).astype(np.int64)
             row = np.round(roi["y"]).astype(np.int64)
@@ -271,11 +335,11 @@ def rasterize_nodule_mask(image_shape, nodules, slices):
     return mask
 
 
-def rasterize_small_points(image_shape, small_points, slices):
+def rasterize_small_points(image_shape, small_points, slices, sop_index):
     point_mask = np.zeros(image_shape, dtype=np.uint8)
     records = []
     for point in small_points:
-        z_idx = find_slice_index_for_xml_z(point["z"], slices)
+        z_idx = find_slice_index_for_annotation(point, slices, sop_index)
         col = int(round(point["x"]))
         row = int(round(point["y"]))
         if 0 <= row < image_shape[0] and 0 <= col < image_shape[1]:
@@ -370,7 +434,8 @@ def process_patient(patient_dir, out_dir):
         if not parsed["nodules"] and not parsed["small_points"]:
             continue
 
-        series_uid = choose_series_uid(series_map, parsed["series_uid"])
+        xml_sop_uids = collect_xml_sop_uids(parsed)
+        series_uid = choose_series_uid(series_map, parsed["series_uid"], xml_sop_uids)
         seen_series_uids[series_uid] = seen_series_uids.get(series_uid, 0) + 1
         if seen_series_uids[series_uid] > 1:
             print(
@@ -379,8 +444,20 @@ def process_patient(patient_dir, out_dir):
             )
 
         image_hu, affine_ras, affine_lps, slices, slice_normal, duplicates = load_dicom_series(series_map[series_uid])
-        mask = rasterize_nodule_mask(image_hu.shape, parsed["nodules"], slices)
-        small_point_mask, point_records = rasterize_small_points(image_hu.shape, parsed["small_points"], slices)
+        sop_index = build_sop_index(slices)
+        matched_xml_sops = len(xml_sop_uids & set(sop_index.keys()))
+        if xml_sop_uids and matched_xml_sops == 0:
+            print(
+                f"[WARN] none of the XML SOP UIDs matched selected CT series | "
+                f"patient={patient} | xml={xml_path} | series={series_uid}"
+            )
+        mask = rasterize_nodule_mask(image_hu.shape, parsed["nodules"], slices, sop_index)
+        small_point_mask, point_records = rasterize_small_points(
+            image_hu.shape,
+            parsed["small_points"],
+            slices,
+            sop_index,
+        )
         small_mask, large_mask, components, voxel_volume_mm3, spacing_mm = split_small_large_masks(mask, affine_ras)
 
         mask_voxels = int(np.sum(mask > 0))
@@ -401,6 +478,8 @@ def process_patient(patient_dir, out_dir):
             "patient": patient,
             "xml_path": xml_path,
             "series_uid": series_uid,
+            "xml_sop_uid_count": len(xml_sop_uids),
+            "matched_xml_sop_uid_count": matched_xml_sops,
             "shape_row_col_slice": list(image.shape),
             "affine_ras": affine_ras.tolist(),
             "affine_lps_dicom": affine_lps.tolist(),

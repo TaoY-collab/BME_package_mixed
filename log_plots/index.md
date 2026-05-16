@@ -1,0 +1,42 @@
+# Log plots
+
+## history_stage2_c3
+
+- [train_loss](log_plots/history_stage2_c3/train_loss.png)
+- [dice_loss](log_plots/history_stage2_c3/dice_loss.png)
+- [tversky_loss](log_plots/history_stage2_c3/tversky_loss.png)
+- [small_local_loss](log_plots/history_stage2_c3/small_local_loss.png)
+- [large_local_loss](log_plots/history_stage2_c3/large_local_loss.png)
+- [lambda_small](log_plots/history_stage2_c3/lambda_small.png)
+- [lambda_large](log_plots/history_stage2_c3/lambda_large.png)
+- [lr](log_plots/history_stage2_c3/lr.png)
+- [validation_dice](log_plots/history_stage2_c3/validation_dice.png)
+- [validation_dice_large](log_plots/history_stage2_c3/validation_dice_large.png)
+- [validation_dice_small](log_plots/history_stage2_c3/validation_dice_small.png)
+- [validation_fp_per_scan](log_plots/history_stage2_c3/validation_fp_per_scan.png)
+- [validation_precision](log_plots/history_stage2_c3/validation_precision.png)
+- [validation_pred_fg](log_plots/history_stage2_c3/validation_pred_fg.png)
+- [validation_pred_gt_large](log_plots/history_stage2_c3/validation_pred_gt_large.png)
+- [validation_pred_gt_small](log_plots/history_stage2_c3/validation_pred_gt_small.png)
+- [validation_pred_gt_volume_ratio](log_plots/history_stage2_c3/validation_pred_gt_volume_ratio.png)
+- [validation_recall](log_plots/history_stage2_c3/validation_recall.png)
+- [validation_recall_large](log_plots/history_stage2_c3/validation_recall_large.png)
+- [validation_recall_small](log_plots/history_stage2_c3/validation_recall_small.png)
+
+## history_stage2_refine
+
+- [train_loss](log_plots/history_stage2_refine/train_loss.png)
+- [val_dice](log_plots/history_stage2_refine/val_dice.png)
+- [val_acc](log_plots/history_stage2_refine/val_acc.png)
+- [lr](log_plots/history_stage2_refine/lr.png)
+- [stage](log_plots/history_stage2_refine/stage.png)
+- [boundary_weight](log_plots/history_stage2_refine/boundary_weight.png)
+- [ce](log_plots/history_stage2_refine/ce.png)
+- [val_pred_fg](log_plots/history_stage2_refine/val_pred_fg.png)
+- [val_label_fg](log_plots/history_stage2_refine/val_label_fg.png)
+- [val_dice_small](log_plots/history_stage2_refine/val_dice_small.png)
+- [val_recall_small](log_plots/history_stage2_refine/val_recall_small.png)
+- [val_precision](log_plots/history_stage2_refine/val_precision.png)
+- [val_recall](log_plots/history_stage2_refine/val_recall.png)
+- [val_fp_per_scan](log_plots/history_stage2_refine/val_fp_per_scan.png)
+- [val_pred_gt_volume_ratio](log_plots/history_stage2_refine/val_pred_gt_volume_ratio.png)

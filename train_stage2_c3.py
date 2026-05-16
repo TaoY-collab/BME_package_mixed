@@ -5,12 +5,14 @@ from datetime import datetime
 import nibabel as nib
 import numpy as np
 import torch
+import torch.nn.functional as F
 from scipy import ndimage as ndi
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 from monai.data import DataLoader, PersistentDataset, list_data_collate
+from monai.inferers import sliding_window_inference
 from monai.losses import DiceLoss, TverskyLoss
 from monai.metrics import DiceMetric
 from monai.transforms import (
@@ -491,16 +493,183 @@ def build_loaders(train_files, val_files, test_files):
     return train_loader, val_loader, test_loader
 
 
+def dice_from_binary(pred, target):
+    pred_sum = float(pred.sum().item())
+    target_sum = float(target.sum().item())
+    if pred_sum + target_sum <= 0:
+        return 1.0
+    intersection = float((pred & target).sum().item())
+    return (2.0 * intersection) / (pred_sum + target_sum + 1e-8)
+
+
+def remove_small_components(pred_labels, min_component_voxels):
+    if min_component_voxels <= 0:
+        return pred_labels
+
+    filtered = []
+    for pred in pred_labels:
+        pred_np = pred.detach().cpu().numpy().astype(bool)
+        labeled, num_components = ndi.label(pred_np)
+        keep = np.zeros_like(pred_np, dtype=bool)
+        for component_id in range(1, num_components + 1):
+            component = labeled == component_id
+            if int(component.sum()) >= min_component_voxels:
+                keep |= component
+        filtered.append(torch.from_numpy(keep.astype(np.int64)).to(pred_labels.device))
+    return torch.stack(filtered, dim=0)
+
+
+def component_size_metrics(pred_case, target_case, size_class):
+    target_np = target_case.detach().cpu().numpy().astype(bool)
+    labeled, num_components = ndi.label(target_np)
+    dice_values = []
+    detected = 0
+    total = 0
+    pred_fg = 0.0
+    label_fg = 0.0
+
+    for component_id in range(1, num_components + 1):
+        component_np = labeled == component_id
+        voxels = int(component_np.sum())
+        if voxels <= 0:
+            continue
+
+        diameter_mm = equivalent_sphere_diameter_mm(voxels, 1.5 * 1.5 * 2.0)
+        if classify_diameter(diameter_mm) != size_class:
+            continue
+
+        component = torch.from_numpy(component_np).to(target_case.device)
+        pred_component = pred_case & component
+        total += 1
+        label_fg += float(component.sum().item())
+        pred_fg += float(pred_component.sum().item())
+        dice_values.append(dice_from_binary(pred_component, component))
+        if float(pred_component.sum().item()) > 0.0:
+            detected += 1
+
+    return {
+        "dice_values": dice_values,
+        "detected": detected,
+        "total": total,
+        "pred_fg": pred_fg,
+        "label_fg": label_fg,
+    }
+
+
+def run_validation_c3(model, data_loader, dice_metric, device, amp_enabled, amp_dtype, threshold, min_cc):
+    model.eval()
+    total_pred_fg = 0.0
+    total_label_fg = 0.0
+    total_tp = 0.0
+    total_fp = 0.0
+    total_fn = 0.0
+    total_false_positive_components = 0
+    scan_count = 0
+
+    small_dice_values = []
+    small_detected = 0
+    small_total = 0
+    small_pred_fg = 0.0
+    small_label_fg = 0.0
+
+    large_dice_values = []
+    large_detected = 0
+    large_total = 0
+    large_pred_fg = 0.0
+    large_label_fg = 0.0
+
+    with torch.inference_mode():
+        for batch in data_loader:
+            inputs = batch["image"].to(device, non_blocking=True)
+            labels = batch["label"].long().to(device, non_blocking=True)
+            valid_shape = train.get_batch_valid_shape(batch, labels)
+
+            with torch.amp.autocast("cuda", enabled=amp_enabled, dtype=amp_dtype if amp_enabled else None):
+                outputs = sliding_window_inference(
+                    inputs,
+                    roi_size=ROI_SIZE,
+                    sw_batch_size=VAL_SW_BATCH_SIZE,
+                    predictor=model,
+                    overlap=INFER_OVERLAP,
+                    mode="gaussian",
+                )
+
+            foreground_probs = torch.softmax(outputs, dim=1)[:, 1]
+            pred_labels = (foreground_probs >= threshold).long()
+            pred_labels = train.crop_tensor_to_shape(pred_labels, valid_shape)
+            labels = train.crop_tensor_to_shape(labels, valid_shape)
+            pred_labels = remove_small_components(pred_labels, min_cc)
+
+            total_pred_fg += float((pred_labels > 0).sum().item())
+            total_label_fg += float((labels > 0).sum().item())
+
+            pred_binary = pred_labels > 0
+            target_binary = labels.squeeze(1) > 0
+
+            total_tp += float((pred_binary & target_binary).sum().item())
+            total_fp += float((pred_binary & ~target_binary).sum().item())
+            total_fn += float((~pred_binary & target_binary).sum().item())
+
+            for batch_idx in range(pred_binary.shape[0]):
+                scan_count += 1
+                pred_case = pred_binary[batch_idx]
+                target_case = target_binary[batch_idx]
+                total_false_positive_components += train.count_false_positive_components(pred_case, target_case)
+
+                small_metrics = component_size_metrics(pred_case, target_case, "small")
+                small_dice_values.extend(small_metrics["dice_values"])
+                small_detected += small_metrics["detected"]
+                small_total += small_metrics["total"]
+                small_pred_fg += small_metrics["pred_fg"]
+                small_label_fg += small_metrics["label_fg"]
+
+                large_metrics = component_size_metrics(pred_case, target_case, "large")
+                large_dice_values.extend(large_metrics["dice_values"])
+                large_detected += large_metrics["detected"]
+                large_total += large_metrics["total"]
+                large_pred_fg += large_metrics["pred_fg"]
+                large_label_fg += large_metrics["label_fg"]
+
+            pred_onehot = F.one_hot(pred_labels, num_classes=2).permute(0, 4, 1, 2, 3).float()
+            label_onehot = F.one_hot(labels.squeeze(1), num_classes=2).permute(0, 4, 1, 2, 3).float()
+            dice_metric(y_pred=pred_onehot, y=label_onehot)
+
+    dice = float(dice_metric.aggregate().item())
+    dice_metric.reset()
+    precision = total_tp / max(total_tp + total_fp, 1e-8)
+    recall = total_tp / max(total_tp + total_fn, 1e-8)
+    fp_per_scan = total_false_positive_components / max(scan_count, 1)
+    pred_gt_volume_ratio = total_pred_fg / max(total_label_fg, 1e-8)
+
+    return dice, {
+        "pred_fg": total_pred_fg,
+        "label_fg": total_label_fg,
+        "dice_small": float(np.mean(small_dice_values)) if small_dice_values else 0.0,
+        "recall_small": small_detected / max(small_total, 1),
+        "dice_large": float(np.mean(large_dice_values)) if large_dice_values else 0.0,
+        "recall_large": large_detected / max(large_total, 1),
+        "precision": precision,
+        "recall": recall,
+        "fp_per_scan": fp_per_scan,
+        "pred_gt_volume_ratio": pred_gt_volume_ratio,
+        "pred_gt_small": small_pred_fg / max(small_label_fg, 1e-8),
+        "pred_gt_large": large_pred_fg / max(large_label_fg, 1e-8),
+        "small_cases": small_total,
+        "large_cases": large_total,
+    }
+
+
 def run_validation_at_point(model, data_loader, dice_metric, device, amp_enabled, amp_dtype, threshold, min_cc):
-    old_threshold = train.PRED_THRESHOLD
-    old_min_cc = train.MIN_COMPONENT_VOXELS
-    train.PRED_THRESHOLD = float(threshold)
-    train.MIN_COMPONENT_VOXELS = int(min_cc)
-    try:
-        dice, info = train.run_validation(model, data_loader, dice_metric, device, amp_enabled, amp_dtype)
-    finally:
-        train.PRED_THRESHOLD = old_threshold
-        train.MIN_COMPONENT_VOXELS = old_min_cc
+    dice, info = run_validation_c3(
+        model,
+        data_loader,
+        dice_metric,
+        device,
+        amp_enabled,
+        amp_dtype,
+        threshold=float(threshold),
+        min_cc=int(min_cc),
+    )
     return {"threshold": float(threshold), "min_cc": int(min_cc), "dice": dice, **info}
 
 
@@ -721,7 +890,16 @@ def main():
         "best_balanced": None,
     }
 
-    val_dice, val_info = train.run_validation(model, val_loader, dice_metric, device, amp_enabled, amp_dtype)
+    val_dice, val_info = run_validation_c3(
+        model,
+        val_loader,
+        dice_metric,
+        device,
+        amp_enabled,
+        amp_dtype,
+        threshold=PRED_THRESHOLD,
+        min_cc=MIN_COMPONENT_VOXELS,
+    )
     val_row = {"threshold": PRED_THRESHOLD, "min_cc": MIN_COMPONENT_VOXELS, "dice": val_dice, **val_info}
     print_online_summary("Epoch 0 validation", val_row)
 
@@ -797,7 +975,16 @@ def main():
         should_validate = display_epoch in VALIDATION_EPOCHS
         val_row = default_val_row()
         if should_validate:
-            val_dice, val_info = train.run_validation(model, val_loader, dice_metric, device, amp_enabled, amp_dtype)
+            val_dice, val_info = run_validation_c3(
+                model,
+                val_loader,
+                dice_metric,
+                device,
+                amp_enabled,
+                amp_dtype,
+                threshold=PRED_THRESHOLD,
+                min_cc=MIN_COMPONENT_VOXELS,
+            )
             val_row = {"threshold": PRED_THRESHOLD, "min_cc": MIN_COMPONENT_VOXELS, "dice": val_dice, **val_info}
             print_online_summary(f"Epoch {display_epoch} validation", val_row)
 

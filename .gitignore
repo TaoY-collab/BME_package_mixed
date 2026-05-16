@@ -1,0 +1,43 @@
+# Raw medical imaging data and generated datasets
+LIDC-IDRI*/
+data*/
+data_stage2_c3*/
+*.dcm
+*.xml
+*.nii
+*.nii.gz
+
+# Training outputs, checkpoints, and caches
+train_runs*/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.npz
+*.npy
+*.pkl
+*.pickle
+
+# Python/runtime artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local environments and editor state
+.venv/
+venv/
+env/
+.env
+.idea/
+.vscode/
+
+# Generated figures/logs
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.log

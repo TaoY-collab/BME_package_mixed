@@ -10,7 +10,6 @@ from scipy import ndimage
 
 from monai.inferers import sliding_window_inference
 from monai.metrics import DiceMetric
-from monai.networks.nets import SwinUNETR
 from monai.transforms import (
     Compose,
     EnsureChannelFirstd,
@@ -22,6 +21,7 @@ from monai.transforms import (
     Spacingd,
     SpatialPadd,
 )
+import train
 from project_config import BEST_MODEL_PATH, DATA_DIR, HISTORY_PATH, TRAINING_CURVE_PATH, VISUALIZATION_PATH
 
 
@@ -204,14 +204,18 @@ def extract_model_state(checkpoint):
 
 
 def build_model(device):
-    model = SwinUNETR(
-        in_channels=1,
-        out_channels=NUM_CLASSES,
-        feature_size=FEATURE_SIZE,
-        use_checkpoint=USE_CHECKPOINT,
-    ).to(device)
+    train.ROI_SIZE = ROI_SIZE
+    train.FEATURE_SIZE = FEATURE_SIZE
+    train.USE_GRAD_CHECKPOINT = USE_CHECKPOINT
+    model = train.build_model(device)
     checkpoint = torch.load(MODEL_PATH, map_location=device)
-    model.load_state_dict(extract_model_state(checkpoint), strict=True)
+    state = extract_model_state(checkpoint)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError:
+        if not hasattr(model, "load_swinunetr_3d_state_dict"):
+            raise
+        model.load_swinunetr_3d_state_dict(state, strict=False)
     model.eval()
     return model
 

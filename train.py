@@ -31,6 +31,7 @@ from monai.transforms import (
     SpatialPadd,
 )
 
+from dual_swin_fusion import DualSwinUNetFusion
 from pretrained_utils import load_pretrained_if_compatible
 from project_config import (
     BEST_MODEL_PATH,
@@ -61,6 +62,11 @@ SPLIT_SEED = 42
 
 ROI_SIZE = (96, 96, 96)
 FEATURE_SIZE = 48
+MODEL_NAME = os.environ.get("BME_MODEL", "swinunetr").lower()
+DUAL_2D_FEATURE_SIZE = int(os.environ.get("BME_DUAL_2D_FEATURE_SIZE", "24"))
+DUAL_2D_PLANE = os.environ.get("BME_DUAL_2D_PLANE", "axial")
+DUAL_FUSION_MODE = os.environ.get("BME_DUAL_FUSION_MODE", "conv")
+DUAL_SLICE_BATCH_SIZE = int(os.environ.get("BME_DUAL_SLICE_BATCH_SIZE", "16"))
 
 TRAIN_BATCH_SIZE = 1
 ACCUMULATION_STEPS = 2
@@ -1283,12 +1289,30 @@ def run_validation(model, data_loader, dice_metric, device, amp_enabled, amp_dty
 
 
 def build_model(device):
-    model = SwinUNETR(
-        in_channels=1,
-        out_channels=2,
-        feature_size=FEATURE_SIZE,
-        use_checkpoint=USE_GRAD_CHECKPOINT,
-    ).to(device)
+    if MODEL_NAME in {"swinunetr", "swin_unetr"}:
+        model = SwinUNETR(
+            in_channels=1,
+            out_channels=2,
+            feature_size=FEATURE_SIZE,
+            use_checkpoint=USE_GRAD_CHECKPOINT,
+        ).to(device)
+        return model
+
+    if MODEL_NAME in {"dual_swin_fusion", "swinunet_swinunetr", "dual"}:
+        model = DualSwinUNetFusion(
+            in_channels=1,
+            out_channels=2,
+            feature_size_3d=FEATURE_SIZE,
+            feature_size_2d=DUAL_2D_FEATURE_SIZE,
+            use_checkpoint=USE_GRAD_CHECKPOINT,
+            plane=DUAL_2D_PLANE,
+            fusion_mode=DUAL_FUSION_MODE,
+            slice_batch_size=DUAL_SLICE_BATCH_SIZE,
+            roi_size=ROI_SIZE,
+        ).to(device)
+        return model
+
+    raise ValueError(f"Unsupported MODEL_NAME/BME_MODEL: {MODEL_NAME}")
     return model
 
 
@@ -1324,7 +1348,17 @@ def load_stage2_source_checkpoint(model, source_path, device):
 
     checkpoint = torch.load(source_path, map_location=device)
     state_dict = extract_model_state(checkpoint)
-    model.load_state_dict(state_dict, strict=True)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError:
+        if not hasattr(model, "load_swinunetr_3d_state_dict"):
+            raise
+        info = model.load_swinunetr_3d_state_dict(state_dict, strict=False)
+        print(
+            "[INFO] loaded stage-2 source checkpoint into dual-model 3D branch | "
+            f"matched={info['matched']} | missing={info['missing']}"
+        )
+        return True
     print(f"[INFO] loaded stage-2 source checkpoint: {source_path}")
     return True
 
@@ -1399,7 +1433,8 @@ def main():
         f"train: {len(train_files)} | val: {len(val_files)} | test: {len(test_files)}"
     )
     print(
-        f"[INFO] config | model=SwinUNETR | roi={ROI_SIZE} | feature_size={FEATURE_SIZE} | "
+        f"[INFO] config | model={MODEL_NAME} | roi={ROI_SIZE} | feature_size_3d={FEATURE_SIZE} | "
+        f"feature_size_2d={DUAL_2D_FEATURE_SIZE} | 2d_plane={DUAL_2D_PLANE} | fusion={DUAL_FUSION_MODE} | "
         f"batch_size={TRAIN_BATCH_SIZE} | accumulation_steps={ACCUMULATION_STEPS} | "
         f"amp={AMP_MODE} | optimizer=AdamW | lr={LEARNING_RATE} | "
         f"weight_decay={WEIGHT_DECAY} | max_epochs={MAX_EPOCHS} | "
@@ -1459,6 +1494,11 @@ def main():
         "val_pred_gt_large": [],
         "loss_mode": LOSS_MODE,
         "run_id": RUN_ID,
+        "model_name": MODEL_NAME,
+        "dual_2d_feature_size": DUAL_2D_FEATURE_SIZE,
+        "dual_2d_plane": DUAL_2D_PLANE,
+        "dual_fusion_mode": DUAL_FUSION_MODE,
+        "dual_slice_batch_size": DUAL_SLICE_BATCH_SIZE,
         "run_best_model_path": run_best_model_path,
         "pred_threshold": PRED_THRESHOLD,
         "tversky_alpha": TVERSKY_ALPHA,
@@ -1535,6 +1575,11 @@ def main():
             "val_info": val_info_epoch0,
         "config": {
             "max_epochs": MAX_EPOCHS,
+            "model_name": MODEL_NAME,
+            "dual_2d_feature_size": DUAL_2D_FEATURE_SIZE,
+            "dual_2d_plane": DUAL_2D_PLANE,
+            "dual_fusion_mode": DUAL_FUSION_MODE,
+            "dual_slice_batch_size": DUAL_SLICE_BATCH_SIZE,
             "learning_rate": LEARNING_RATE,
             "lambda_dice": LAMBDA_DICE,
             "lambda_tversky": LAMBDA_TVERSKY,
@@ -1706,6 +1751,11 @@ def main():
                 "val_info": val_info,
                 "config": {
                     "max_epochs": MAX_EPOCHS,
+                    "model_name": MODEL_NAME,
+                    "dual_2d_feature_size": DUAL_2D_FEATURE_SIZE,
+                    "dual_2d_plane": DUAL_2D_PLANE,
+                    "dual_fusion_mode": DUAL_FUSION_MODE,
+                    "dual_slice_batch_size": DUAL_SLICE_BATCH_SIZE,
                     "learning_rate": LEARNING_RATE,
                     "lambda_dice": LAMBDA_DICE,
                     "lambda_tversky": LAMBDA_TVERSKY,
@@ -1736,6 +1786,11 @@ def main():
             "epoch": epoch,
             "split_sizes": history["split_sizes"],
             "loss_mode": LOSS_MODE,
+            "model_name": MODEL_NAME,
+            "dual_2d_feature_size": DUAL_2D_FEATURE_SIZE,
+            "dual_2d_plane": DUAL_2D_PLANE,
+            "dual_fusion_mode": DUAL_FUSION_MODE,
+            "dual_slice_batch_size": DUAL_SLICE_BATCH_SIZE,
             "run_id": RUN_ID,
             "run_best_model_path": run_best_model_path,
             "pred_threshold": PRED_THRESHOLD,

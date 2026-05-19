@@ -48,7 +48,12 @@ def load_model(model_path, device):
     except TypeError:
         payload = torch.load(model_path, map_location=device)
     state = train.extract_model_state(payload)
-    model.load_state_dict(state, strict=True)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError:
+        if not hasattr(model, "load_swinunetr_3d_state_dict"):
+            raise
+        model.load_swinunetr_3d_state_dict(state, strict=False)
     model.eval()
     return model, payload
 

@@ -109,7 +109,8 @@ def load_pretrained_if_compatible(model, checkpoint_path, device, min_match=1, v
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=True)
     except TypeError:
         checkpoint = torch.load(checkpoint_path, map_location=device)
-    info = inspect_pretrained_match(model, checkpoint)
+    target_model = model.pretrained_target() if hasattr(model, "pretrained_target") else model
+    info = inspect_pretrained_match(target_model, checkpoint)
     matched_state = info["matched_state"]
 
     if verbose:
@@ -140,9 +141,9 @@ def load_pretrained_if_compatible(model, checkpoint_path, device, min_match=1, v
             "sample_mismatched_shape": info["mismatched_shape_keys"][:10],
         }
 
-    model_state = model.state_dict()
+    model_state = target_model.state_dict()
     model_state.update(matched_state)
-    model.load_state_dict(model_state, strict=False)
+    target_model.load_state_dict(model_state, strict=False)
 
     if verbose:
         print(f"[INFO] loaded compatible pretrained parameters: {len(matched_state)}")

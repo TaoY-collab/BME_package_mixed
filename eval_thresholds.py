@@ -45,7 +45,12 @@ def load_model(model_path, device):
     model = train.build_model(device)
     checkpoint = torch.load(model_path, map_location=device)
     state_dict = train.extract_model_state(checkpoint)
-    model.load_state_dict(state_dict, strict=True)
+    try:
+        model.load_state_dict(state_dict, strict=True)
+    except RuntimeError:
+        if not hasattr(model, "load_swinunetr_3d_state_dict"):
+            raise
+        model.load_swinunetr_3d_state_dict(state_dict, strict=False)
     return model
 
 

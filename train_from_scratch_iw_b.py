@@ -398,7 +398,12 @@ def load_model_payload(path, model, device):
     except TypeError:
         payload = torch.load(path, map_location=device)
     state = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-    model.load_state_dict(state, strict=True)
+    try:
+        model.load_state_dict(state, strict=True)
+    except RuntimeError:
+        if not hasattr(model, "load_swinunetr_3d_state_dict"):
+            raise
+        model.load_swinunetr_3d_state_dict(state, strict=False)
     return payload
 
 

@@ -32,10 +32,9 @@ MANIFEST_PATH = os.path.join(RUN_DIR, "manifest_2d.json")
 BEST_MODEL_PATH = os.path.join(RUN_DIR, "best_swinunet2d.pth")
 FINAL_MODEL_PATH = os.path.join(RUN_DIR, "final_swinunet2d.pth")
 HISTORY_PATH = os.path.join(RUN_DIR, "history_swinunet2d.json")
-DEFAULT_PRETRAINED_PATH = os.path.join(SAVE_DIR, "pretrained_2d", "swin_tiny_patch4_window7_224.pth")
 
 IMG_SIZE = int(os.environ.get("BME_2D_IMG_SIZE", "224"))
-EMBED_DIM = int(os.environ.get("BME_2D_EMBED_DIM", "96"))
+EMBED_DIM = int(os.environ.get("BME_2D_EMBED_DIM", "48"))
 BATCH_SIZE = int(os.environ.get("BME_2D_BATCH_SIZE", "8"))
 MAX_EPOCHS = int(os.environ.get("BME_2D_MAX_EPOCHS", "60"))
 MAX_TRAIN_SECONDS = int(os.environ.get("BME_2D_MAX_TRAIN_SECONDS", str(4 * 60 * 60)))
@@ -53,8 +52,6 @@ EARLY_STOPPING = os.environ.get("BME_2D_EARLY_STOPPING", "0") == "1"
 PATIENCE = int(os.environ.get("BME_2D_PATIENCE", "15"))
 HU_MIN = float(os.environ.get("BME_2D_HU_MIN", "-1000"))
 HU_MAX = float(os.environ.get("BME_2D_HU_MAX", "400"))
-PRETRAINED_PATH = os.environ.get("BME_2D_PRETRAINED_PATH", DEFAULT_PRETRAINED_PATH)
-LOAD_PRETRAINED = os.environ.get("BME_2D_LOAD_PRETRAINED", "1") != "0"
 
 
 def set_seed(seed):
@@ -177,32 +174,17 @@ def generate_2d_slices(data_dir, force=False):
     return manifest
 
 
-def build_shared_3d_split(data_dir):
-    import train as train3d
-
-    data_list = train3d.build_data_list(data_dir)
-    data_list = train3d.limit_data_list(data_list, train3d.MAX_DATASET_SIZE)
-    train_files, val_files, test_files = train3d.split_data_list(data_list)
-    return train_files, val_files, test_files
-
-
-def split_records_by_shared_3d_split(records, data_dir):
-    train_files, val_files, test_files = build_shared_3d_split(data_dir)
-    train_cases = {case["id"] for case in train_files}
-    val_cases = {case["id"] for case in val_files}
-    test_cases = {case["id"] for case in test_files}
-
-    train_records = [record for record in records if record["case_id"] in train_cases]
+def split_records_by_case(records):
+    case_ids = sorted({record["case_id"] for record in records})
+    rng = np.random.default_rng(SPLIT_SEED)
+    rng.shuffle(case_ids)
+    val_count = max(1, int(round(len(case_ids) * VAL_RATIO))) if len(case_ids) > 1 else 1
+    val_cases = set(case_ids[:val_count])
+    train_records = [record for record in records if record["case_id"] not in val_cases]
     val_records = [record for record in records if record["case_id"] in val_cases]
-    test_records = [record for record in records if record["case_id"] in test_cases]
-    return (
-        train_records,
-        val_records,
-        test_records,
-        sorted(train_cases),
-        sorted(val_cases),
-        sorted(test_cases),
-    )
+    if not train_records:
+        train_records = val_records
+    return train_records, val_records, sorted(set(record["case_id"] for record in train_records)), sorted(val_cases)
 
 
 def count_pos_neg(records):
@@ -270,76 +252,6 @@ def build_model(device):
         window_size=7,
         drop_path_rate=0.1,
     ).to(device)
-
-
-def extract_pretrained_state(payload):
-    if isinstance(payload, dict):
-        for key in ("model", "state_dict", "network", "module"):
-            value = payload.get(key)
-            if isinstance(value, dict):
-                return value
-    if isinstance(payload, dict):
-        return payload
-    raise TypeError(f"Unsupported pretrained checkpoint type: {type(payload)}")
-
-
-def normalize_pretrained_key(key):
-    for prefix in ("module.", "model."):
-        if key.startswith(prefix):
-            key = key[len(prefix) :]
-    return key
-
-
-def load_pretrained_if_available(model, path, device):
-    if not LOAD_PRETRAINED:
-        print("[INFO] 2D pretrained loading disabled by BME_2D_LOAD_PRETRAINED=0")
-        return {"loaded": False, "path": path, "matched": 0, "missing": len(model.state_dict())}
-    if not path or not os.path.exists(path):
-        print(f"[WARN] 2D pretrained checkpoint not found: {path}")
-        print("[WARN] run: python download_2d_swinunet_weights.py")
-        return {"loaded": False, "path": path, "matched": 0, "missing": len(model.state_dict())}
-
-    try:
-        payload = torch.load(path, map_location=device, weights_only=False)
-    except TypeError:
-        payload = torch.load(path, map_location=device)
-
-    pretrained_state = extract_pretrained_state(payload)
-    model_state = model.state_dict()
-    matched = {}
-    mismatched = []
-    unexpected = []
-    for raw_key, value in pretrained_state.items():
-        key = normalize_pretrained_key(raw_key)
-        if key not in model_state:
-            unexpected.append(raw_key)
-            continue
-        if tuple(value.shape) != tuple(model_state[key].shape):
-            mismatched.append(key)
-            continue
-        matched[key] = value
-
-    updated = dict(model_state)
-    updated.update(matched)
-    model.load_state_dict(updated, strict=False)
-    info = {
-        "loaded": bool(matched),
-        "path": path,
-        "matched": len(matched),
-        "missing": len(model_state) - len(matched),
-        "unexpected": len(unexpected),
-        "mismatched": len(mismatched),
-        "sample_mismatched": mismatched[:10],
-        "sample_unexpected": unexpected[:10],
-    }
-    print(
-        "[INFO] 2D pretrained load | "
-        f"path={path} | matched={info['matched']} | missing={info['missing']} | "
-        f"unexpected={info['unexpected']} | mismatched={info['mismatched']}"
-    )
-    if info["matched"] == 0:
-        print("[WARN] no pretrained tensors matched. For official Swin-T weights, use BME_2D_EMBED_DIM=96.")
-    return info
 
 
 def dice_from_logits(logits, mask, threshold=PRED_THRESHOLD):
@@ -411,15 +323,11 @@ def main():
     set_seed(SPLIT_SEED)
     manifest = generate_2d_slices(args.data_dir, force=args.force_generate)
     records = manifest["records"]
-    train_records, val_records, test_records, train_cases, val_cases, test_cases = split_records_by_shared_3d_split(
-        records,
-        args.data_dir,
-    )
+    train_records, val_records, train_cases, val_cases = split_records_by_case(records)
     if not train_records or not val_records:
-        raise RuntimeError("2D train/val split is empty; check generated masks and shared 3D split.")
+        raise RuntimeError("2D train/val split is empty; check generated masks and source labels.")
     train_pos, train_neg = count_pos_neg(train_records)
     val_pos, val_neg = count_pos_neg(val_records)
-    test_pos, test_neg = count_pos_neg(test_records)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = device.type == "cuda"
@@ -448,7 +356,6 @@ def main():
     )
 
     model = build_model(device)
-    pretrained_info = load_pretrained_if_available(model, PRETRAINED_PATH, device)
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
     scheduler = CosineAnnealingLR(optimizer, T_max=max(MAX_EPOCHS, 1))
     scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
@@ -471,27 +378,18 @@ def main():
         "early_stopping": EARLY_STOPPING,
         "train_cases": train_cases,
         "val_cases": val_cases,
-        "test_cases": test_cases,
         "train_slices": len(train_records),
         "train_positive_slices": train_pos,
         "train_negative_slices": train_neg,
         "val_slices": len(val_records),
         "val_positive_slices": val_pos,
         "val_negative_slices": val_neg,
-        "test_slices": len(test_records),
-        "test_positive_slices": test_pos,
-        "test_negative_slices": test_neg,
-        "split_source": "train.py shared 3D split",
-        "pretrained_path": PRETRAINED_PATH,
-        "load_pretrained": LOAD_PRETRAINED,
-        "pretrained_info": pretrained_info,
+        "no_pretraining": True,
     }
     print(
         f"[INFO] 2D Swin-Unet | train_slices={len(train_records)} "
         f"(pos={train_pos}, neg={train_neg}) | val_slices={len(val_records)} "
-        f"(pos={val_pos}, neg={val_neg}) | test_slices={len(test_records)} "
-        f"(pos={test_pos}, neg={test_neg}) | train_cases={train_cases} | "
-        f"val_cases={val_cases} | test_cases={test_cases} | "
+        f"(pos={val_pos}, neg={val_neg}) | train_cases={train_cases} | val_cases={val_cases} | "
         f"balanced_sampling={BALANCED_SAMPLING} | samples_per_epoch={len(train_loader.dataset) if train_sampler is None else train_sampler.num_samples} | "
         f"early_stopping={EARLY_STOPPING} | device={device} | max_time={MAX_TRAIN_SECONDS}s"
     )

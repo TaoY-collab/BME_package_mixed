@@ -51,11 +51,11 @@ except ImportError:
 
 
 # =========================
-# DGX Spark config
+# RTX 4060 config (defaults tuned for 8GB VRAM)
 # =========================
 
 EXPECTED_DATASET_SIZE = int(os.environ.get("BME_EXPECTED_DATASET_SIZE", "1000"))
-MAX_DATASET_SIZE = int(os.environ.get("BME_MAX_DATASET_SIZE", "400"))
+MAX_DATASET_SIZE = int(os.environ.get("BME_MAX_DATASET_SIZE", "32"))
 TRAIN_RATIO = 0.7
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
@@ -80,10 +80,10 @@ def env_bool(name, default):
     return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
-ROI_SIZE = parse_roi_size(os.environ.get("BME_ROI_SIZE"), default=(96, 96, 96))
-FEATURE_SIZE = int(os.environ.get("BME_FEATURE_SIZE", "48"))
-MODEL_NAME = os.environ.get("BME_MODEL", "swinunetr").lower()
-DUAL_2D_FEATURE_SIZE = int(os.environ.get("BME_DUAL_2D_FEATURE_SIZE", "24"))
+ROI_SIZE = parse_roi_size(os.environ.get("BME_ROI_SIZE"), default=(64, 64, 64))
+FEATURE_SIZE = int(os.environ.get("BME_FEATURE_SIZE", "12"))
+MODEL_NAME = os.environ.get("BME_MODEL", "coarse_to_fine").lower()
+DUAL_2D_FEATURE_SIZE = int(os.environ.get("BME_DUAL_2D_FEATURE_SIZE", "12"))
 DUAL_2D_PLANE = os.environ.get("BME_DUAL_2D_PLANE", "axial")
 DUAL_FUSION_MODE = os.environ.get("BME_DUAL_FUSION_MODE", "conv")
 DUAL_SLICE_BATCH_SIZE = int(os.environ.get("BME_DUAL_SLICE_BATCH_SIZE", "16"))
@@ -92,10 +92,10 @@ CTF_RESIDUAL_SCALE = float(os.environ.get("BME_CTF_RESIDUAL_SCALE", "0.35"))
 CTF_DETACH_COARSE_PRIOR = env_bool("BME_CTF_DETACH_COARSE_PRIOR", True)
 
 TRAIN_BATCH_SIZE = int(os.environ.get("BME_TRAIN_BATCH_SIZE", "1"))
-ACCUMULATION_STEPS = int(os.environ.get("BME_ACCUMULATION_STEPS", "2"))
+ACCUMULATION_STEPS = int(os.environ.get("BME_ACCUMULATION_STEPS", "4"))
 
-AMP_MODE = os.environ.get("BME_AMP_MODE", "bf16").lower()
-MAX_EPOCHS = int(os.environ.get("BME_MAX_EPOCHS", "200"))
+AMP_MODE = os.environ.get("BME_AMP_MODE", "fp16").lower()
+MAX_EPOCHS = int(os.environ.get("BME_MAX_EPOCHS", "5"))
 WARMUP_EPOCHS = int(os.environ.get("BME_WARMUP_EPOCHS", "10"))
 
 VAL_INTERVAL = 2
@@ -115,9 +115,9 @@ USE_GRAD_CHECKPOINT = True
 TRAIN_NUM_WORKERS = int(os.environ.get("BME_TRAIN_NUM_WORKERS", "4"))
 VAL_NUM_WORKERS = int(os.environ.get("BME_VAL_NUM_WORKERS", "2"))
 
-LOSS_MODE = os.environ.get("BME_LOSS_MODE", "ours").lower()  # "baseline", "ours", "stage2_refine", or "coarse_to_fine"
+LOSS_MODE = os.environ.get("BME_LOSS_MODE", "coarse_to_fine").lower()  # "baseline", "ours", "stage2_refine", or "coarse_to_fine"
 
-STAGE2_REFINEMENT = env_bool("BME_STAGE2_REFINEMENT", True)
+STAGE2_REFINEMENT = env_bool("BME_STAGE2_REFINEMENT", False)
 STAGE1_BEST_ARCHIVE_PATH = os.path.join(SAVE_DIR, "best_stage1.pth")
 STAGE2_SOURCE_CKPT = os.environ.get("BME_STAGE2_SOURCE_CKPT", STAGE1_BEST_ARCHIVE_PATH)
 STAGE2_CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint_stage2_refine.pth")

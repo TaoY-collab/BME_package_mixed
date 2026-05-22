@@ -22,14 +22,30 @@ from monai.transforms import (
     SpatialPadd,
 )
 import train
-from project_config import BEST_MODEL_PATH, DATA_DIR, HISTORY_PATH, TRAINING_CURVE_PATH, VISUALIZATION_PATH
+from project_config import DATA_DIR, HISTORY_PATH, TRAINING_CURVE_PATH, VISUALIZATION_PATH
 
 
-MODEL_PATH = BEST_MODEL_PATH
-SAVE_FIG_PATH = VISUALIZATION_PATH
-SAVE_CURVE_PATH = TRAINING_CURVE_PATH
-ROI_SIZE = (96, 96, 96)
-FEATURE_SIZE = 48
+def parse_roi_size(value, default=(64, 64, 64)):
+    if not value:
+        return default
+    parts = str(value).lower().replace("x", ",").split(",")
+    parsed = tuple(int(part.strip()) for part in parts if part.strip())
+    if len(parsed) == 1:
+        return (parsed[0], parsed[0], parsed[0])
+    if len(parsed) != 3:
+        raise ValueError("BME_ROI_SIZE must be one integer or three values, for example 64 or 64,64,64")
+    return parsed
+
+
+MODEL_PATH = os.environ.get("BME_VIZ_MODEL_PATH", os.path.join(train.SAVE_DIR, "best_model.pth"))
+SAVE_FIG_PATH = os.environ.get("BME_VIZ_FIG_PATH", VISUALIZATION_PATH)
+SAVE_CURVE_PATH = os.environ.get("BME_VIZ_CURVE_PATH", TRAINING_CURVE_PATH)
+ROI_SIZE = parse_roi_size(os.environ.get("BME_ROI_SIZE"), default=(64, 64, 64))
+FEATURE_SIZE = int(os.environ.get("BME_FEATURE_SIZE", "12"))
+DUAL_2D_FEATURE_SIZE = int(os.environ.get("BME_DUAL_2D_FEATURE_SIZE", "12"))
+CTF_CONTEXT_SLICES = int(os.environ.get("BME_CTF_CONTEXT_SLICES", "3"))
+CTF_RESIDUAL_SCALE = float(os.environ.get("BME_CTF_RESIDUAL_SCALE", "0.35"))
+CTF_DETACH_COARSE_PRIOR = os.environ.get("BME_CTF_DETACH_COARSE_PRIOR", "1").strip().lower() not in {"0", "false", "no", "off"}
 USE_CHECKPOINT = True
 NUM_CLASSES = 2
 NUM_SLICES = 5
@@ -41,7 +57,7 @@ TEST_COUNT = 150
 SPLIT_SEED = 42
 RANDOM_CASE_SEED = 42
 INFER_OVERLAP = 0.5
-APPLY_POSTPROCESS =True
+APPLY_POSTPROCESS = True
 MIN_COMPONENT_SIZE = 80
 KEEP_LARGEST_COMPONENT_ONLY = False
 MAX_COMPONENTS_TO_REPORT = 10
@@ -206,7 +222,12 @@ def extract_model_state(checkpoint):
 def build_model(device):
     train.ROI_SIZE = ROI_SIZE
     train.FEATURE_SIZE = FEATURE_SIZE
+    train.DUAL_2D_FEATURE_SIZE = DUAL_2D_FEATURE_SIZE
+    train.CTF_CONTEXT_SLICES = CTF_CONTEXT_SLICES
+    train.CTF_RESIDUAL_SCALE = CTF_RESIDUAL_SCALE
+    train.CTF_DETACH_COARSE_PRIOR = CTF_DETACH_COARSE_PRIOR
     train.USE_GRAD_CHECKPOINT = USE_CHECKPOINT
+    train.MODEL_NAME = os.environ.get("BME_MODEL", "coarse_to_fine").lower()
     model = train.build_model(device)
     checkpoint = torch.load(MODEL_PATH, map_location=device)
     state = extract_model_state(checkpoint)

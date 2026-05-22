@@ -32,7 +32,7 @@ from monai.transforms import (
     SpatialPadd,
 )
 
-from dual_swin_fusion import CoarseToFineResidualSwinFusion, DualSwinUNetFusion
+from dual_swin_fusion import DualSwinUNetFusion
 from pretrained_utils import load_pretrained_if_compatible
 from project_config import (
     BEST_MODEL_PATH,
@@ -51,59 +51,37 @@ except ImportError:
 
 
 # =========================
-# RTX 4060 config (defaults tuned for 8GB VRAM)
+# DGX Spark config
 # =========================
 
-EXPECTED_DATASET_SIZE = int(os.environ.get("BME_EXPECTED_DATASET_SIZE", "1000"))
-MAX_DATASET_SIZE = int(os.environ.get("BME_MAX_DATASET_SIZE", "32"))
+EXPECTED_DATASET_SIZE = 1000
+MAX_DATASET_SIZE = 400
 TRAIN_RATIO = 0.7
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 SPLIT_SEED = 42
 
-def parse_roi_size(value, default=(96, 96, 96)):
-    if not value:
-        return default
-    parts = str(value).lower().replace("x", ",").split(",")
-    parsed = tuple(int(part.strip()) for part in parts if part.strip())
-    if len(parsed) == 1:
-        return (parsed[0], parsed[0], parsed[0])
-    if len(parsed) != 3:
-        raise ValueError("BME_ROI_SIZE must be one integer or three values, for example 64 or 96,96,96")
-    return parsed
-
-
-def env_bool(name, default):
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.strip().lower() not in {"0", "false", "no", "off"}
-
-
-ROI_SIZE = parse_roi_size(os.environ.get("BME_ROI_SIZE"), default=(64, 64, 64))
-FEATURE_SIZE = int(os.environ.get("BME_FEATURE_SIZE", "12"))
-MODEL_NAME = os.environ.get("BME_MODEL", "coarse_to_fine").lower()
-DUAL_2D_FEATURE_SIZE = int(os.environ.get("BME_DUAL_2D_FEATURE_SIZE", "12"))
+ROI_SIZE = (96, 96, 96)
+FEATURE_SIZE = 48
+MODEL_NAME = os.environ.get("BME_MODEL", "swinunetr").lower()
+DUAL_2D_FEATURE_SIZE = int(os.environ.get("BME_DUAL_2D_FEATURE_SIZE", "24"))
 DUAL_2D_PLANE = os.environ.get("BME_DUAL_2D_PLANE", "axial")
 DUAL_FUSION_MODE = os.environ.get("BME_DUAL_FUSION_MODE", "conv")
 DUAL_SLICE_BATCH_SIZE = int(os.environ.get("BME_DUAL_SLICE_BATCH_SIZE", "16"))
-CTF_CONTEXT_SLICES = int(os.environ.get("BME_CTF_CONTEXT_SLICES", "3"))
-CTF_RESIDUAL_SCALE = float(os.environ.get("BME_CTF_RESIDUAL_SCALE", "0.35"))
-CTF_DETACH_COARSE_PRIOR = env_bool("BME_CTF_DETACH_COARSE_PRIOR", True)
 
-TRAIN_BATCH_SIZE = int(os.environ.get("BME_TRAIN_BATCH_SIZE", "1"))
-ACCUMULATION_STEPS = int(os.environ.get("BME_ACCUMULATION_STEPS", "4"))
+TRAIN_BATCH_SIZE = 1
+ACCUMULATION_STEPS = 2
 
-AMP_MODE = os.environ.get("BME_AMP_MODE", "fp16").lower()
-MAX_EPOCHS = int(os.environ.get("BME_MAX_EPOCHS", "5"))
-WARMUP_EPOCHS = int(os.environ.get("BME_WARMUP_EPOCHS", "10"))
+AMP_MODE = "bf16"
+MAX_EPOCHS = 200
+WARMUP_EPOCHS = 10
 
 VAL_INTERVAL = 2
 LATE_VAL_START_EPOCH = 100
 LATE_VAL_INTERVAL = 1
 
-LEARNING_RATE = float(os.environ.get("BME_LR", "1e-4"))
-WEIGHT_DECAY = float(os.environ.get("BME_WEIGHT_DECAY", "1e-5"))
+LEARNING_RATE = 1e-4
+WEIGHT_DECAY = 1e-5
 
 VAL_SW_BATCH_SIZE = 2
 INFER_OVERLAP = 0.5
@@ -115,11 +93,11 @@ USE_GRAD_CHECKPOINT = True
 TRAIN_NUM_WORKERS = int(os.environ.get("BME_TRAIN_NUM_WORKERS", "4"))
 VAL_NUM_WORKERS = int(os.environ.get("BME_VAL_NUM_WORKERS", "2"))
 
-LOSS_MODE = os.environ.get("BME_LOSS_MODE", "coarse_to_fine").lower()  # "baseline", "ours", "stage2_refine", or "coarse_to_fine"
+LOSS_MODE = "ours"  # "baseline", "ours", or "stage2_refine"
 
-STAGE2_REFINEMENT = env_bool("BME_STAGE2_REFINEMENT", False)
+STAGE2_REFINEMENT = True
 STAGE1_BEST_ARCHIVE_PATH = os.path.join(SAVE_DIR, "best_stage1.pth")
-STAGE2_SOURCE_CKPT = os.environ.get("BME_STAGE2_SOURCE_CKPT", STAGE1_BEST_ARCHIVE_PATH)
+STAGE2_SOURCE_CKPT = STAGE1_BEST_ARCHIVE_PATH
 STAGE2_CHECKPOINT_PATH = os.path.join(SAVE_DIR, "checkpoint_stage2_refine.pth")
 STAGE2_BEST_MODEL_PATH = os.path.join(SAVE_DIR, "best_stage2_refine.pth")
 STAGE2_HISTORY_PATH = os.path.join(SAVE_DIR, "history_stage2_refine.json")
@@ -142,11 +120,6 @@ FOCAL_TVERSKY_GAMMA = 0.75
 LAMBDA_BOUNDARY_MAX = 0.02
 BOUNDARY_RAMP_START = 40
 BOUNDARY_RAMP_END = 120
-LAMBDA_CTF_COARSE = float(os.environ.get("BME_LAMBDA_CTF_COARSE", "0.35"))
-LAMBDA_CTF_REFINE = float(os.environ.get("BME_LAMBDA_CTF_REFINE", "0.25"))
-LAMBDA_CTF_RESIDUAL_RECALL = float(os.environ.get("BME_LAMBDA_CTF_RESIDUAL_RECALL", "0.15"))
-LAMBDA_CTF_FP_SUPPRESSION = float(os.environ.get("BME_LAMBDA_CTF_FP_SUPPRESSION", "0.05"))
-LAMBDA_CTF_BG_CONSISTENCY = float(os.environ.get("BME_LAMBDA_CTF_BG_CONSISTENCY", "0.03"))
 
 STAGE2B_MAX_EPOCHS = 30
 STAGE2B_LAMBDA_IW_MAX = 0.03
@@ -442,107 +415,6 @@ class Stage2RefinementLoss(torch.nn.Module):
         return total, loss_info
 
 
-class CoarseToFineResidualLoss(torch.nn.Module):
-    def __init__(
-        self,
-        lambda_coarse=0.35,
-        lambda_refine=0.25,
-        lambda_residual_recall=0.15,
-        lambda_fp_suppression=0.05,
-        lambda_bg_consistency=0.03,
-    ):
-        super().__init__()
-        self.lambda_coarse = lambda_coarse
-        self.lambda_refine = lambda_refine
-        self.lambda_residual_recall = lambda_residual_recall
-        self.lambda_fp_suppression = lambda_fp_suppression
-        self.lambda_bg_consistency = lambda_bg_consistency
-        self.final_loss = Stage2RefinementLoss(
-            num_classes=2,
-            lambda_dice=LAMBDA_DICE,
-            lambda_tversky=LAMBDA_TVERSKY,
-            lambda_ce=LAMBDA_CE,
-            lambda_boundary_max=LAMBDA_BOUNDARY_MAX,
-            boundary_ramp_start=BOUNDARY_RAMP_START,
-            boundary_ramp_end=BOUNDARY_RAMP_END,
-            tversky_alpha=TVERSKY_ALPHA,
-            tversky_beta=TVERSKY_BETA,
-            focal_tversky_gamma=FOCAL_TVERSKY_GAMMA,
-            foreground_ce_weight=FOREGROUND_CE_WEIGHT,
-        )
-        self.aux_loss = DiceTverskyBoundaryLoss(
-            num_classes=2,
-            lambda_dice=LAMBDA_DICE,
-            lambda_tversky=LAMBDA_TVERSKY,
-            lambda_boundary_max=0.0,
-            tversky_alpha=TVERSKY_ALPHA,
-            tversky_beta=TVERSKY_BETA,
-        )
-
-    @staticmethod
-    def _foreground_prob(logits):
-        return torch.softmax(logits, dim=1)[:, 1:2]
-
-    def residual_recall_loss(self, refine_logits, coarse_prob, labels):
-        refine_fg = self._foreground_prob(refine_logits)
-        target = (labels > 0).float()
-        missed_weight = target * torch.clamp(1.0 - coarse_prob.detach(), min=0.0, max=1.0)
-        denominator = missed_weight.sum().clamp_min(1.0)
-        return (missed_weight * (1.0 - refine_fg)).sum() / denominator
-
-    def false_positive_suppression_loss(self, refine_logits, coarse_prob, labels):
-        refine_fg = self._foreground_prob(refine_logits)
-        background = (labels == 0).float()
-        low_coarse_conf = torch.clamp(1.0 - coarse_prob.detach(), min=0.0, max=1.0)
-        denominator = background.sum().clamp_min(1.0)
-        return (background * low_coarse_conf * refine_fg).sum() / denominator
-
-    def background_consistency_loss(self, fused_logits, coarse_prob, labels):
-        fused_fg = self._foreground_prob(fused_logits)
-        background = (labels == 0).float()
-        denominator = background.sum().clamp_min(1.0)
-        return (background * torch.square(fused_fg - coarse_prob.detach())).sum() / denominator
-
-    def forward(self, outputs, labels, epoch):
-        if not isinstance(outputs, dict):
-            return self.final_loss(outputs, labels, epoch)
-
-        fused = outputs["fused"]
-        logits_3d = outputs["logits_3d"]
-        logits_refine = outputs["logits_refine"]
-        coarse_prob = outputs.get("coarse_prob", self._foreground_prob(logits_3d))
-
-        total, info = self.final_loss(fused, labels, epoch)
-        coarse_loss, coarse_info = self.aux_loss(logits_3d, labels, epoch)
-        refine_loss, refine_info = self.aux_loss(logits_refine, labels, epoch)
-        residual_recall = self.residual_recall_loss(logits_refine, coarse_prob, labels)
-        fp_suppression = self.false_positive_suppression_loss(logits_refine, coarse_prob, labels)
-        bg_consistency = self.background_consistency_loss(fused, coarse_prob, labels)
-
-        total = (
-            total
-            + self.lambda_coarse * coarse_loss
-            + self.lambda_refine * refine_loss
-            + self.lambda_residual_recall * residual_recall
-            + self.lambda_fp_suppression * fp_suppression
-            + self.lambda_bg_consistency * bg_consistency
-        )
-        info = dict(info)
-        info.update(
-            {
-                "stage": 2,
-                "coarse_aux": float(coarse_loss.detach().item()),
-                "refine_aux": float(refine_loss.detach().item()),
-                "residual_recall": float(residual_recall.detach().item()),
-                "fp_suppression": float(fp_suppression.detach().item()),
-                "bg_consistency": float(bg_consistency.detach().item()),
-                "coarse_dice": float(coarse_info["dice"]),
-                "refine_dice": float(refine_info["dice"]),
-            }
-        )
-        return total, info
-
-
 def build_loss():
     if LOSS_MODE == "baseline":
         return BaselineDiceCELoss()
@@ -570,14 +442,6 @@ def build_loss():
             tversky_beta=TVERSKY_BETA,
             focal_tversky_gamma=FOCAL_TVERSKY_GAMMA,
             foreground_ce_weight=FOREGROUND_CE_WEIGHT,
-        )
-    if LOSS_MODE in {"coarse_to_fine", "ctf", "residual_refine"}:
-        return CoarseToFineResidualLoss(
-            lambda_coarse=LAMBDA_CTF_COARSE,
-            lambda_refine=LAMBDA_CTF_REFINE,
-            lambda_residual_recall=LAMBDA_CTF_RESIDUAL_RECALL,
-            lambda_fp_suppression=LAMBDA_CTF_FP_SUPPRESSION,
-            lambda_bg_consistency=LAMBDA_CTF_BG_CONSISTENCY,
         )
     raise ValueError(f"Unsupported LOSS_MODE: {LOSS_MODE}")
 
@@ -1449,22 +1313,6 @@ def build_model(device):
         ).to(device)
         return model
 
-    if MODEL_NAME in {"coarse_to_fine", "ctf", "residual_fusion", "coarse_to_fine_residual"}:
-        model = CoarseToFineResidualSwinFusion(
-            in_channels=1,
-            out_channels=2,
-            feature_size_3d=FEATURE_SIZE,
-            feature_size_2d=DUAL_2D_FEATURE_SIZE,
-            use_checkpoint=USE_GRAD_CHECKPOINT,
-            plane=DUAL_2D_PLANE,
-            slice_batch_size=DUAL_SLICE_BATCH_SIZE,
-            roi_size=ROI_SIZE,
-            context_slices=CTF_CONTEXT_SLICES,
-            residual_scale=CTF_RESIDUAL_SCALE,
-            detach_coarse_prior=CTF_DETACH_COARSE_PRIOR,
-        ).to(device)
-        return model
-
     raise ValueError(f"Unsupported MODEL_NAME/BME_MODEL: {MODEL_NAME}")
     return model
 
@@ -1548,12 +1396,6 @@ def print_validation_summary(prefix, dice, val_info):
     )
 
 
-def model_forward_for_loss(model, inputs):
-    if getattr(model, "supports_aux_loss", False):
-        return model(inputs, return_aux=True)
-    return model(inputs)
-
-
 def main():
     os.makedirs(SAVE_DIR, exist_ok=True)
     os.makedirs(BEST_MODELS_DIR, exist_ok=True)
@@ -1594,8 +1436,6 @@ def main():
     print(
         f"[INFO] config | model={MODEL_NAME} | roi={ROI_SIZE} | feature_size_3d={FEATURE_SIZE} | "
         f"feature_size_2d={DUAL_2D_FEATURE_SIZE} | 2d_plane={DUAL_2D_PLANE} | fusion={DUAL_FUSION_MODE} | "
-        f"ctf_context={CTF_CONTEXT_SLICES} | ctf_residual_scale={CTF_RESIDUAL_SCALE} | "
-        f"ctf_detach_prior={CTF_DETACH_COARSE_PRIOR} | "
         f"batch_size={TRAIN_BATCH_SIZE} | accumulation_steps={ACCUMULATION_STEPS} | "
         f"amp={AMP_MODE} | optimizer=AdamW | lr={LEARNING_RATE} | "
         f"weight_decay={WEIGHT_DECAY} | max_epochs={MAX_EPOCHS} | "
@@ -1653,10 +1493,6 @@ def main():
         "val_pred_gt_volume_ratio": [],
         "val_pred_gt_small": [],
         "val_pred_gt_large": [],
-        "coarse_aux_loss": [],
-        "refine_aux_loss": [],
-        "residual_recall_loss": [],
-        "fp_suppression_loss": [],
         "loss_mode": LOSS_MODE,
         "run_id": RUN_ID,
         "model_name": MODEL_NAME,
@@ -1664,9 +1500,6 @@ def main():
         "dual_2d_plane": DUAL_2D_PLANE,
         "dual_fusion_mode": DUAL_FUSION_MODE,
         "dual_slice_batch_size": DUAL_SLICE_BATCH_SIZE,
-        "ctf_context_slices": CTF_CONTEXT_SLICES,
-        "ctf_residual_scale": CTF_RESIDUAL_SCALE,
-        "ctf_detach_coarse_prior": CTF_DETACH_COARSE_PRIOR,
         "run_best_model_path": run_best_model_path,
         "pred_threshold": PRED_THRESHOLD,
         "tversky_alpha": TVERSKY_ALPHA,
@@ -1680,13 +1513,6 @@ def main():
         "medium_nodule_voxels": MEDIUM_NODULE_VOXELS,
         "stage2_refinement": STAGE2_REFINEMENT,
         "stage2_source_ckpt": STAGE2_SOURCE_CKPT if STAGE2_REFINEMENT else "",
-        "ctf_loss": {
-            "lambda_coarse": LAMBDA_CTF_COARSE,
-            "lambda_refine": LAMBDA_CTF_REFINE,
-            "lambda_residual_recall": LAMBDA_CTF_RESIDUAL_RECALL,
-            "lambda_fp_suppression": LAMBDA_CTF_FP_SUPPRESSION,
-            "lambda_bg_consistency": LAMBDA_CTF_BG_CONSISTENCY,
-        },
         "split_sizes": {
             "train": len(train_files),
             "val": len(val_files),
@@ -1783,10 +1609,6 @@ def main():
         epoch_tversky = 0.0
         epoch_ce = 0.0
         epoch_boundary = 0.0
-        epoch_coarse_aux = 0.0
-        epoch_refine_aux = 0.0
-        epoch_residual_recall = 0.0
-        epoch_fp_suppression = 0.0
         last_loss_info = {
             "stage": 1,
             "dice": 0.0,
@@ -1794,10 +1616,6 @@ def main():
             "ce": 0.0,
             "boundary": 0.0,
             "boundary_weight": 0.0,
-            "coarse_aux": 0.0,
-            "refine_aux": 0.0,
-            "residual_recall": 0.0,
-            "fp_suppression": 0.0,
         }
 
         progress = tqdm(train_loader, desc=f"Epoch {epoch + 1}/{MAX_EPOCHS}")
@@ -1810,7 +1628,7 @@ def main():
                 enabled=amp_enabled,
                 dtype=amp_dtype if amp_enabled else None,
             ):
-                outputs = model_forward_for_loss(model, inputs)
+                outputs = model(inputs)
                 loss, loss_info = loss_func(outputs, labels, epoch)
                 loss_for_backward = loss / ACCUMULATION_STEPS
 
@@ -1832,10 +1650,6 @@ def main():
             epoch_tversky += float(loss_info["tversky"])
             epoch_ce += float(loss_info.get("ce", 0.0))
             epoch_boundary += float(loss_info["boundary"])
-            epoch_coarse_aux += float(loss_info.get("coarse_aux", 0.0))
-            epoch_refine_aux += float(loss_info.get("refine_aux", 0.0))
-            epoch_residual_recall += float(loss_info.get("residual_recall", 0.0))
-            epoch_fp_suppression += float(loss_info.get("fp_suppression", 0.0))
             last_loss_info = loss_info
 
         scheduler.step()
@@ -1846,10 +1660,6 @@ def main():
         avg_tversky_loss = epoch_tversky / num_batches
         avg_ce_loss = epoch_ce / num_batches
         avg_boundary_loss = epoch_boundary / num_batches
-        avg_coarse_aux = epoch_coarse_aux / num_batches
-        avg_refine_aux = epoch_refine_aux / num_batches
-        avg_residual_recall = epoch_residual_recall / num_batches
-        avg_fp_suppression = epoch_fp_suppression / num_batches
         current_lr = optimizer.param_groups[0]["lr"]
 
         current_val_interval = LATE_VAL_INTERVAL if (epoch + 1) >= LATE_VAL_START_EPOCH else VAL_INTERVAL
@@ -1901,10 +1711,6 @@ def main():
         history["val_pred_gt_volume_ratio"].append(val_info["pred_gt_volume_ratio"])
         history["val_pred_gt_small"].append(val_info["pred_gt_small"])
         history["val_pred_gt_large"].append(val_info["pred_gt_large"])
-        history["coarse_aux_loss"].append(avg_coarse_aux)
-        history["refine_aux_loss"].append(avg_refine_aux)
-        history["residual_recall_loss"].append(avg_residual_recall)
-        history["fp_suppression_loss"].append(avg_fp_suppression)
 
         print(
             f"Epoch {epoch + 1} | "
@@ -1915,10 +1721,6 @@ def main():
             f"LTversky={avg_tversky_loss:.4f} | "
             f"LCE={avg_ce_loss:.4f} | "
             f"LBoundary={avg_boundary_loss:.4f} | "
-            f"LCoarseAux={avg_coarse_aux:.4f} | "
-            f"LRefineAux={avg_refine_aux:.4f} | "
-            f"LResidualRecall={avg_residual_recall:.4f} | "
-            f"LFPSuppress={avg_fp_suppression:.4f} | "
             f"LambdaBoundary={last_loss_info['boundary_weight']:.4f} | "
             f"DiceSmall={val_info['dice_small']:.4f} | "
             f"RecallSmall={val_info['recall_small']:.4f} | "

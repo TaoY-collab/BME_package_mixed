@@ -21,24 +21,20 @@ data:
   small_cc_voxels: 128
   large_cc_voxels: 4096
   overwrite_aux: false
-  use_d2: true
-  d2_percentile: 99.0
   num_workers: 4
 
 model:
   name: hybrid_swin_sdf_core
   num_classes: 1
   img_size: [96, 96, 96]
-  in_channels: 2
+  in_channels: 1
   ct_in_channels: 1
-  use_d2_aux_branch: true
-  d2_in_channels: 1
-  d2_aux_channels: 16
   swin_feature_channels: 16
   two_d_feature_channels: 16
   fusion_channels: 32
   feature_size: 24
   use_checkpoint: true
+  use_global_position_encoding: true
 
 loss:
   warmup_epochs: 15

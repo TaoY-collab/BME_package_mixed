@@ -124,7 +124,6 @@ LOG_COLUMNS = [
 IMAGE_KEY = "image"
 LABEL_KEY = "label"
 MASK_ALIAS_KEY = "mask"
-D2_KEY = "image_d2"
 
 DEFAULT_CONFIG_PATH = "configs/task_adaptive.yaml"
 DEFAULT_OUTPUT_DIR = "outputs"
@@ -156,8 +155,6 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "small_cc_voxels": 128,
         "large_cc_voxels": 4096,
         "overwrite_aux": False,
-        "use_d2": False,
-        "d2_percentile": 99.0,
         "num_workers": 4,
     },
     "model": {
@@ -166,14 +163,12 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "img_size": [96, 96, 96],
         "in_channels": 1,
         "ct_in_channels": 1,
-        "use_d2_aux_branch": False,
-        "d2_in_channels": 1,
-        "d2_aux_channels": 16,
         "swin_feature_channels": 16,
         "two_d_feature_channels": 16,
         "fusion_channels": 32,
         "feature_size": 24,
         "use_checkpoint": True,
+        "use_global_position_encoding": True,
     },
     "loss": {
         "warmup_epochs": 15,
@@ -906,93 +901,6 @@ class EnsureMaskAliasd(MapTransform):
         return d
 
 
-class ComputeSecondOrderDiffd(MapTransform):
-    """
-    Build a z-axis second-order difference map from the normalized CT image.
-
-    Expected image shape after EnsureChannelFirstd / LoadNPZPatchd:
-        [C, D, H, W]
-    The D dimension is the slice direction after Orientationd + Spacingd.
-    """
-
-    def __init__(
-        self,
-        image_key: str = IMAGE_KEY,
-        out_key: str = D2_KEY,
-        percentile: float = 99.0,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__(keys=[image_key], allow_missing_keys=False)
-        self.image_key = image_key
-        self.out_key = out_key
-        self.percentile = float(percentile)
-        self.eps = float(eps)
-
-    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        d = dict(data)
-        image = np.asarray(d[self.image_key], dtype=np.float32)
-
-        if image.ndim == 3:
-            image = image[None]
-        if image.ndim != 4:
-            raise ValueError(
-                f"{self.image_key} must be [D,H,W] or [C,D,H,W] before D2, "
-                f"got shape={image.shape}"
-            )
-
-        d2 = np.zeros_like(image, dtype=np.float32)
-        depth = int(image.shape[1])
-
-        if depth >= 3:
-            d2[:, 1:-1] = np.abs(image[:, 2:] - 2.0 * image[:, 1:-1] + image[:, :-2])
-            d2[:, 0] = d2[:, 1]
-            d2[:, -1] = d2[:, -2]
-        elif depth == 2:
-            first_diff = np.abs(image[:, 1] - image[:, 0])
-            d2[:, 0] = first_diff
-            d2[:, 1] = first_diff
-
-        p = float(np.percentile(d2, self.percentile)) if d2.size > 0 else 0.0
-        if np.isfinite(p) and p > self.eps:
-            d2 = np.clip(d2, 0.0, p) / p
-        else:
-            d2 = np.zeros_like(d2, dtype=np.float32)
-
-        d[self.out_key] = d2.astype(np.float32, copy=False)
-        return d
-
-
-class MergeD2ToImaged(MapTransform):
-    """Concatenate CT and D2 channels only after spatial and CT intensity augments."""
-
-    def __init__(
-        self,
-        image_key: str = IMAGE_KEY,
-        d2_key: str = D2_KEY,
-    ) -> None:
-        super().__init__(keys=[image_key, d2_key], allow_missing_keys=False)
-        self.image_key = image_key
-        self.d2_key = d2_key
-
-    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        d = dict(data)
-        image = d[self.image_key]
-        d2 = d[self.d2_key]
-
-        if torch.is_tensor(image):
-            if not torch.is_tensor(d2):
-                d2 = torch.as_tensor(d2, dtype=image.dtype, device=image.device)
-            else:
-                d2 = d2.to(dtype=image.dtype, device=image.device)
-            d[self.image_key] = torch.cat([image, d2], dim=0)
-            return d
-
-        image_np = np.asarray(image, dtype=np.float32)
-        d2_np = np.asarray(d2, dtype=np.float32)
-        d[self.image_key] = np.concatenate([image_np, d2_np], axis=0).astype(np.float32, copy=False)
-        return d
-
-
 class BuildAuxTargetsd(MapTransform):
     """
     由 label 构建 boundary / dist_map / component_weight / sample_label。
@@ -1137,14 +1045,11 @@ def build_transforms(
     large_cc_voxels: int,
     overwrite_aux: bool,
     is_train: bool,
-    use_d2: bool = False,
-    d2_percentile: float = 99.0,
 ) -> Compose:
     roi_size = tuple(int(v) for v in roi_size)
     target_spacing = tuple(float(v) for v in target_spacing)
     profile_ratios = list(float(v) for v in profile_ratios)
-    use_d2 = bool(use_d2)
-    rotate_spatial_axes = (1, 2) if use_d2 else (0, 1)
+    rotate_spatial_axes = (0, 1)
 
     aux_builder = BuildAuxTargetsd(
         label_key=LABEL_KEY,
@@ -1156,13 +1061,9 @@ def build_transforms(
     if input_format == "npz_patch":
         keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "sdf", "dist_map", "boundary", "core", "component_weight", "sample_label"]
         spatial_keys = list(keys)
-        if use_d2:
-            spatial_keys.append(D2_KEY)
         transforms: List[Any] = [
             LoadNPZPatchd(npz_key="npz_path"),
         ]
-        if use_d2:
-            transforms.append(ComputeSecondOrderDiffd(percentile=d2_percentile))
         transforms += [
             EnsureMaskAliasd(label_key=LABEL_KEY),
             aux_builder,
@@ -1181,8 +1082,6 @@ def build_transforms(
                 RandScaleIntensityd(keys=[IMAGE_KEY], factors=0.10, prob=0.30),
                 RandShiftIntensityd(keys=[IMAGE_KEY], offsets=0.10, prob=0.30),
             ]
-        if use_d2:
-            transforms.append(MergeD2ToImaged())
         return Compose(transforms)
 
     if input_format != "image_label":
@@ -1193,8 +1092,6 @@ def build_transforms(
 
     base_keys = [IMAGE_KEY, label_source_key]
     crop_keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "sdf", "dist_map", "boundary", "core", "component_weight", "sample_label"]
-    if use_d2:
-        crop_keys.append(D2_KEY)
 
     deterministic: List[Any] = [
         LoadImaged(keys=base_keys),
@@ -1230,13 +1127,10 @@ def build_transforms(
             )
         )
 
-    if use_d2:
-        deterministic.append(ComputeSecondOrderDiffd(percentile=d2_percentile))
-
     deterministic += [
         EnsureMaskAliasd(label_key=LABEL_KEY),
         CropForegroundd(
-            keys=[IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY] + ([D2_KEY] if use_d2 else []),
+            keys=[IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY],
             source_key=IMAGE_KEY,
             margin=8,
             allow_smaller=True,
@@ -1246,8 +1140,6 @@ def build_transforms(
     ]
 
     if not is_train:
-        if use_d2:
-            deterministic.append(MergeD2ToImaged())
         return Compose(deterministic)
 
     random_part = [
@@ -1269,9 +1161,6 @@ def build_transforms(
         RandScaleIntensityd(keys=[IMAGE_KEY], factors=0.10, prob=0.30),
         RandShiftIntensityd(keys=[IMAGE_KEY], offsets=0.10, prob=0.30),
     ]
-
-    if use_d2:
-        random_part.append(MergeD2ToImaged())
 
     return Compose(deterministic + random_part)
 
@@ -1318,8 +1207,6 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
-    use_d2 = bool(data_cfg.get("use_d2", False))
-    d2_percentile = float(data_cfg.get("d2_percentile", 99.0))
 
     train_tfms = build_transforms(
         input_format=input_format,
@@ -1333,8 +1220,6 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=True,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
     val_tfms = build_transforms(
         input_format=input_format,
@@ -1348,8 +1233,6 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=False,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
 
     output_dir = resolve_runtime_path(cfg.get("output", {}).get("output_dir", DEFAULT_OUTPUT_DIR))
@@ -1360,7 +1243,7 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     )
     ensure_dir(cache_root)
 
-    cache_tag = f"{input_format}_d2" if use_d2 else input_format
+    cache_tag = input_format
 
     train_ds = PersistentDataset(
         data=train_records,
@@ -1465,14 +1348,12 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
                 img_size=tuple(int(v) for v in img_size),
                 in_channels=int(model_cfg.get("in_channels", 1)),
                 ct_in_channels=model_cfg.get("ct_in_channels", None),
-                use_d2_aux_branch=bool(model_cfg.get("use_d2_aux_branch", False)),
-                d2_in_channels=int(model_cfg.get("d2_in_channels", 1)),
-                d2_aux_channels=int(model_cfg.get("d2_aux_channels", model_cfg.get("swin_feature_channels", 16))),
                 swin_feature_channels=int(model_cfg.get("swin_feature_channels", 16)),
                 two_d_feature_channels=int(model_cfg.get("two_d_feature_channels", 16)),
                 fusion_channels=int(model_cfg.get("fusion_channels", 32)),
                 feature_size=int(model_cfg.get("feature_size", 24)),
                 use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
+                use_global_position_encoding=bool(model_cfg.get("use_global_position_encoding", True)),
             )
 
     if name in {"swinunetr", "generic_swinunetr", "swin_unetr"} or HybridSwinSDFCoreNet is None:

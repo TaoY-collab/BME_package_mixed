@@ -313,14 +313,12 @@ def build_model(cfg: Dict[str, Any]) -> HybridSwinSDFCoreNet:
         img_size=tuple(model_cfg.get("img_size", [64, 64, 64])),
         in_channels=int(model_cfg.get("in_channels", 1)),
         ct_in_channels=model_cfg.get("ct_in_channels", None),
-        use_d2_aux_branch=bool(model_cfg.get("use_d2_aux_branch", False)),
-        d2_in_channels=int(model_cfg.get("d2_in_channels", 1)),
-        d2_aux_channels=int(model_cfg.get("d2_aux_channels", model_cfg.get("swin_feature_channels", 16))),
         swin_feature_channels=int(model_cfg.get("swin_feature_channels", 16)),
         two_d_feature_channels=int(model_cfg.get("two_d_feature_channels", 16)),
         fusion_channels=int(model_cfg.get("fusion_channels", 32)),
         feature_size=int(model_cfg.get("feature_size", 24)),
         use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
+        use_global_position_encoding=bool(model_cfg.get("use_global_position_encoding", True)),
     )
 
     return model
@@ -409,8 +407,6 @@ def build_test_loader(
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
-    use_d2 = bool(data_cfg.get("use_d2", False))
-    d2_percentile = float(data_cfg.get("d2_percentile", 99.0))
 
     test_tfms = build_transforms(
         input_format=input_format,
@@ -424,8 +420,6 @@ def build_test_loader(
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=False,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
 
     output_dir = resolve_runtime_path(cfg.get("output", {}).get("output_dir", DEFAULT_OUTPUT_DIR))
@@ -435,7 +429,7 @@ def build_test_loader(
         else output_dir / "persistent_cache"
     )
     ensure_dir(cache_root)
-    cache_tag = f"{input_format}_d2" if use_d2 else input_format
+    cache_tag = input_format
 
     eval_batch_size = cfg.get("eval", {}).get("batch_size", None)
     batch_size = int(eval_batch_size if eval_batch_size is not None else train_cfg.get("batch_size", 1))

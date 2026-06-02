@@ -249,6 +249,47 @@ class PredictionHead3D(nn.Module):
         return self.head(x)
 
 
+class GlobalPositionEncoding3D(nn.Module):
+    """
+    Global 3D coordinate position encoding.
+
+    A normalized z/y/x coordinate grid is projected to the feature channel
+    dimension and added to the 3D backbone feature map.
+    """
+
+    def __init__(self, channels: int) -> None:
+        super().__init__()
+        if channels <= 0:
+            raise ValueError(f"channels must be positive, got {channels}")
+
+        self.proj = nn.Conv3d(
+            in_channels=3,
+            out_channels=int(channels),
+            kernel_size=1,
+            stride=1,
+            padding=0,
+            bias=True,
+        )
+        nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.proj.bias)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 5:
+            raise ValueError(f"x must be [B, C, D, H, W], got shape={tuple(x.shape)}")
+
+        _, _, depth, height, width = x.shape
+        z = torch.linspace(-1.0, 1.0, steps=depth, device=x.device, dtype=x.dtype)
+        y = torch.linspace(-1.0, 1.0, steps=height, device=x.device, dtype=x.dtype)
+        x_coord = torch.linspace(-1.0, 1.0, steps=width, device=x.device, dtype=x.dtype)
+
+        zz = z.view(1, 1, depth, 1, 1).expand(1, 1, depth, height, width)
+        yy = y.view(1, 1, 1, height, 1).expand(1, 1, depth, height, width)
+        xx = x_coord.view(1, 1, 1, 1, width).expand(1, 1, depth, height, width)
+        coords = torch.cat([zz, yy, xx], dim=1)
+
+        return self.proj(coords)
+
+
 class HybridSwinSDFCoreNet(nn.Module):
     """
     Hybrid-Swin-SDF-CoreNet 主模型。
@@ -284,30 +325,24 @@ class HybridSwinSDFCoreNet(nn.Module):
         img_size: Sequence[int] | int = (64, 64, 64),
         in_channels: int = 1,
         ct_in_channels: int | None = None,
-        use_d2_aux_branch: bool = False,
-        d2_in_channels: int = 1,
-        d2_aux_channels: int = 16,
         swin_feature_channels: int = 16,
         two_d_feature_channels: int = 16,
         fusion_channels: int = 32,
         feature_size: int = 24,
         use_checkpoint: bool = True,
+        use_global_position_encoding: bool = True,
     ) -> None:
         super().__init__()
 
         self.img_size = _to_3tuple(img_size)
         self.in_channels = int(in_channels)
-        self.use_d2_aux_branch = bool(use_d2_aux_branch)
-        self.d2_in_channels = int(d2_in_channels)
-        if ct_in_channels is None:
-            ct_in_channels = self.in_channels - self.d2_in_channels if self.use_d2_aux_branch else self.in_channels
-        self.ct_in_channels = int(ct_in_channels)
-        self.d2_aux_channels = int(d2_aux_channels)
+        self.ct_in_channels = self.in_channels if ct_in_channels is None else int(ct_in_channels)
         self.swin_feature_channels = int(swin_feature_channels)
         self.two_d_feature_channels = int(two_d_feature_channels)
         self.fusion_channels = int(fusion_channels)
         self.feature_size = int(feature_size)
         self.use_checkpoint = bool(use_checkpoint)
+        self.use_global_position_encoding = bool(use_global_position_encoding)
 
         if self.in_channels <= 0:
             raise ValueError(f"in_channels 必须大于 0，但当前为 {self.in_channels}")
@@ -315,17 +350,11 @@ class HybridSwinSDFCoreNet(nn.Module):
         if self.ct_in_channels <= 0:
             raise ValueError(f"ct_in_channels must be positive, got {self.ct_in_channels}")
 
-        if self.use_d2_aux_branch:
-            if self.d2_in_channels <= 0:
-                raise ValueError(f"d2_in_channels must be positive, got {self.d2_in_channels}")
-            if self.ct_in_channels + self.d2_in_channels != self.in_channels:
-                raise ValueError(
-                    "When use_d2_aux_branch=True, in_channels must equal "
-                    f"ct_in_channels + d2_in_channels, got {self.in_channels} vs "
-                    f"{self.ct_in_channels} + {self.d2_in_channels}"
-                )
-            if self.d2_aux_channels <= 0:
-                raise ValueError(f"d2_aux_channels must be positive, got {self.d2_aux_channels}")
+        if self.ct_in_channels != self.in_channels:
+            raise ValueError(
+                "Auxiliary input channels have been removed; "
+                f"ct_in_channels must match in_channels, got {self.ct_in_channels} vs {self.in_channels}"
+            )
 
         if self.swin_feature_channels <= 0:
             raise ValueError(
@@ -348,7 +377,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         # 这里 out_channels 不是最终类别数，而是 3D feature 通道数。
         self.swin3d = _create_swin_unetr_compatible(
             img_size=self.img_size,
-            in_channels=self.ct_in_channels,
+            in_channels=self.in_channels,
             out_channels=self.swin_feature_channels,
             feature_size=self.feature_size,
             use_checkpoint=self.use_checkpoint,
@@ -362,40 +391,20 @@ class HybridSwinSDFCoreNet(nn.Module):
             padding=0,
         )
 
+        self.global_position_encoding = (
+            GlobalPositionEncoding3D(channels=self.fusion_channels)
+            if self.use_global_position_encoding
+            else None
+        )
+
         # 2D 分支：三视角共享 2D encoder，再还原成 3D feature。
         self.projector2d = MultiView2DProjector(
-            in_channels=self.ct_in_channels,
+            in_channels=self.in_channels,
             encoder_base_channels=self.two_d_feature_channels,
             encoder_out_channels=self.two_d_feature_channels,
             out_channels=self.two_d_feature_channels,
             num_blocks=3,
         )
-
-        # D2 auxiliary branch: lightweight CNN + concat + 1x1x1 fusion.
-        if self.use_d2_aux_branch:
-            self.d2_branch = nn.Sequential(
-                ConvNormAct3D(
-                    in_channels=self.d2_in_channels,
-                    out_channels=self.d2_aux_channels,
-                    kernel_size=3,
-                    padding=1,
-                ),
-                ConvNormAct3D(
-                    in_channels=self.d2_aux_channels,
-                    out_channels=self.fusion_channels,
-                    kernel_size=3,
-                    padding=1,
-                ),
-            )
-            self.d2_fuse = ConvNormAct3D(
-                in_channels=self.fusion_channels * 2,
-                out_channels=self.fusion_channels,
-                kernel_size=1,
-                padding=0,
-            )
-        else:
-            self.d2_branch = None
-            self.d2_fuse = None
 
         # 2D-3D 门控融合。
         self.gated_fusion = GatedFusion3D(
@@ -494,12 +503,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         self._check_input(x)
 
         target_size = tuple(x.shape[2:])
-        if self.use_d2_aux_branch:
-            ct_x = x[:, : self.ct_in_channels]
-            d2_x = x[:, self.ct_in_channels : self.ct_in_channels + self.d2_in_channels]
-        else:
-            ct_x = x
-            d2_x = None
+        ct_x = x
 
         # 3D SwinUNETR 分支。
         f3d = self.swin3d(ct_x)
@@ -514,16 +518,8 @@ class HybridSwinSDFCoreNet(nn.Module):
         # 投影到 fusion_channels。
         f3d = self.swin_feature_proj(f3d)
 
-        if self.use_d2_aux_branch:
-            if self.d2_branch is None or self.d2_fuse is None or d2_x is None:
-                raise RuntimeError("D2 auxiliary branch is enabled but its modules are not initialized.")
-            f_d2 = self.d2_branch(d2_x)
-            f_d2 = self._resize_to_input(
-                feat=f_d2,
-                target_size=target_size,
-                name="f_d2",
-            )
-            f3d = self.d2_fuse(torch.cat([f3d, f_d2], dim=1))
+        if self.global_position_encoding is not None:
+            f3d = f3d + self.global_position_encoding(f3d)
 
         # 2D 三视角纹理分支。
         f2d = self.projector2d(ct_x)

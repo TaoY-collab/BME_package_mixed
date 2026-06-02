@@ -460,8 +460,6 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
-    use_d2 = bool(data_cfg.get("use_d2", False))
-    d2_percentile = float(data_cfg.get("d2_percentile", 99.0))
 
     val_tfms = build_transforms(
         input_format="image_label",
@@ -475,8 +473,6 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=False,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
 
     output_dir = get_output_dir(cfg)
@@ -490,7 +486,7 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
     val_ds = PersistentDataset(
         data=records,
         transform=val_tfms,
-        cache_dir=cache_root / ("val_whole_volume_d2" if use_d2 else "val_whole_volume"),
+        cache_dir=cache_root / "val_whole_volume",
     )
 
     return val_ds, input_format, val_csv

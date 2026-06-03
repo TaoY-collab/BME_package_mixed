@@ -8,13 +8,13 @@ Hybrid-Swin-SDF-CoreNet 主模型文件。
     HybridSwinSDFCoreNet
 
 模型输入：
-    x: [B, 1, 64, 64, 64]
+    x: [B, 1, 96, 96, 96]
 
 模型输出：
     {
-        "mask_logits": [B, 1, 64, 64, 64],
-        "sdf":         [B, 1, 64, 64, 64],
-        "core_logits": [B, 1, 64, 64, 64]
+        "mask_logits": [B, 1, 96, 96, 96],
+        "sdf":         [B, 1, 96, 96, 96],
+        "core_logits": [B, 1, 96, 96, 96]
     }
 
 整体结构：
@@ -249,19 +249,23 @@ class PredictionHead3D(nn.Module):
         return self.head(x)
 
 
-class GlobalPositionEncoding3D(nn.Module):
+class PositionEncoding3D(nn.Module):
     """
-    Global 3D coordinate position encoding.
+    3D coordinate position encoding.
 
-    A normalized z/y/x coordinate grid is projected to the feature channel
-    dimension and added to the 3D backbone feature map.
+    If patch_center_dhw is provided, coordinates are absolute positions in the
+    resampled volume coordinate system, scaled by absolute_scale_mm. Otherwise,
+    the module falls back to normalized patch-relative coordinates in [-1, 1].
     """
 
-    def __init__(self, channels: int) -> None:
+    def __init__(self, channels: int, absolute_scale_mm: float = 128.0) -> None:
         super().__init__()
         if channels <= 0:
             raise ValueError(f"channels must be positive, got {channels}")
+        if absolute_scale_mm <= 0:
+            raise ValueError(f"absolute_scale_mm must be positive, got {absolute_scale_mm}")
 
+        self.absolute_scale_mm = float(absolute_scale_mm)
         self.proj = nn.Conv3d(
             in_channels=3,
             out_channels=int(channels),
@@ -273,19 +277,77 @@ class GlobalPositionEncoding3D(nn.Module):
         nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
         nn.init.zeros_(self.proj.bias)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    @staticmethod
+    def _as_batch_3_vector(value: torch.Tensor, batch_size: int, x: torch.Tensor) -> torch.Tensor:
+        value = torch.as_tensor(value, device=x.device, dtype=x.dtype)
+        if value.ndim == 1:
+            value = value.view(1, 3).expand(batch_size, 3)
+        elif value.ndim >= 2:
+            value = value.view(value.shape[0], -1)[:, :3]
+            if value.shape[0] == 1 and batch_size > 1:
+                value = value.expand(batch_size, 3)
+        if value.shape != (batch_size, 3):
+            raise ValueError(f"position metadata must be [B,3] or [3], got shape={tuple(value.shape)}")
+        return value
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_coords: torch.Tensor | None = None,
+        patch_center_dhw: torch.Tensor | None = None,
+        spacing_mm: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if x.ndim != 5:
             raise ValueError(f"x must be [B, C, D, H, W], got shape={tuple(x.shape)}")
 
-        _, _, depth, height, width = x.shape
-        z = torch.linspace(-1.0, 1.0, steps=depth, device=x.device, dtype=x.dtype)
-        y = torch.linspace(-1.0, 1.0, steps=height, device=x.device, dtype=x.dtype)
-        x_coord = torch.linspace(-1.0, 1.0, steps=width, device=x.device, dtype=x.dtype)
+        batch_size, _, depth, height, width = x.shape
+        if position_coords is not None:
+            coords = torch.as_tensor(position_coords, device=x.device, dtype=x.dtype)
+            if coords.ndim == 4:
+                coords = coords.unsqueeze(0)
+            if coords.shape[1] != 3:
+                raise ValueError(f"position_coords must have 3 channels, got shape={tuple(coords.shape)}")
+            if coords.shape[0] == 1 and batch_size > 1:
+                coords = coords.expand(batch_size, -1, -1, -1, -1)
+            if coords.shape[0] != batch_size:
+                raise ValueError(f"position_coords batch mismatch: {coords.shape[0]} vs {batch_size}")
+            if coords.shape[2:] != (depth, height, width):
+                coords = F.interpolate(coords, size=(depth, height, width), mode="trilinear", align_corners=False)
+            return self.proj(coords / self.absolute_scale_mm)
 
-        zz = z.view(1, 1, depth, 1, 1).expand(1, 1, depth, height, width)
-        yy = y.view(1, 1, 1, height, 1).expand(1, 1, depth, height, width)
-        xx = x_coord.view(1, 1, 1, 1, width).expand(1, 1, depth, height, width)
+        if patch_center_dhw is None:
+            z = torch.linspace(-1.0, 1.0, steps=depth, device=x.device, dtype=x.dtype)
+            y = torch.linspace(-1.0, 1.0, steps=height, device=x.device, dtype=x.dtype)
+            x_coord = torch.linspace(-1.0, 1.0, steps=width, device=x.device, dtype=x.dtype)
+
+            zz = z.view(1, 1, depth, 1, 1).expand(batch_size, 1, depth, height, width)
+            yy = y.view(1, 1, 1, height, 1).expand(batch_size, 1, depth, height, width)
+            xx = x_coord.view(1, 1, 1, 1, width).expand(batch_size, 1, depth, height, width)
+            coords = torch.cat([zz, yy, xx], dim=1)
+            return self.proj(coords)
+
+        center = self._as_batch_3_vector(patch_center_dhw, batch_size, x)
+        if spacing_mm is None:
+            spacing = torch.ones_like(center)
+        else:
+            spacing = self._as_batch_3_vector(spacing_mm, batch_size, x)
+
+        patch_shape = torch.tensor([depth, height, width], device=x.device, dtype=x.dtype)
+        start = center - torch.floor(patch_shape / 2.0)
+
+        z = torch.arange(depth, device=x.device, dtype=x.dtype).view(1, depth, 1, 1)
+        y = torch.arange(height, device=x.device, dtype=x.dtype).view(1, 1, height, 1)
+        x_coord = torch.arange(width, device=x.device, dtype=x.dtype).view(1, 1, 1, width)
+
+        zz = (start[:, 0].view(batch_size, 1, 1, 1) + z) * spacing[:, 0].view(batch_size, 1, 1, 1)
+        yy = (start[:, 1].view(batch_size, 1, 1, 1) + y) * spacing[:, 1].view(batch_size, 1, 1, 1)
+        xx = (start[:, 2].view(batch_size, 1, 1, 1) + x_coord) * spacing[:, 2].view(batch_size, 1, 1, 1)
+
+        zz = zz.view(batch_size, 1, depth, 1, 1).expand(batch_size, 1, depth, height, width)
+        yy = yy.view(batch_size, 1, 1, height, 1).expand(batch_size, 1, depth, height, width)
+        xx = xx.view(batch_size, 1, 1, 1, width).expand(batch_size, 1, depth, height, width)
         coords = torch.cat([zz, yy, xx], dim=1)
+        coords = coords / self.absolute_scale_mm
 
         return self.proj(coords)
 
@@ -297,7 +359,7 @@ class HybridSwinSDFCoreNet(nn.Module):
     参数
     ----
     img_size:
-        输入 patch 尺寸，默认 (64, 64, 64)。
+        输入 patch 尺寸，默认 (96, 96, 96)。
 
     in_channels:
         输入通道数，LIDC-IDRI CT patch 默认为 1。
@@ -322,15 +384,16 @@ class HybridSwinSDFCoreNet(nn.Module):
 
     def __init__(
         self,
-        img_size: Sequence[int] | int = (64, 64, 64),
+        img_size: Sequence[int] | int = (96, 96, 96),
         in_channels: int = 1,
         ct_in_channels: int | None = None,
-        swin_feature_channels: int = 16,
-        two_d_feature_channels: int = 16,
-        fusion_channels: int = 32,
-        feature_size: int = 24,
+        swin_feature_channels: int = 12,
+        two_d_feature_channels: int = 12,
+        fusion_channels: int = 24,
+        feature_size: int = 12,
         use_checkpoint: bool = True,
-        use_global_position_encoding: bool = True,
+        use_absolute_position_encoding: bool = True,
+        absolute_position_scale_mm: float = 128.0,
     ) -> None:
         super().__init__()
 
@@ -342,7 +405,8 @@ class HybridSwinSDFCoreNet(nn.Module):
         self.fusion_channels = int(fusion_channels)
         self.feature_size = int(feature_size)
         self.use_checkpoint = bool(use_checkpoint)
-        self.use_global_position_encoding = bool(use_global_position_encoding)
+        self.use_absolute_position_encoding = bool(use_absolute_position_encoding)
+        self.absolute_position_scale_mm = float(absolute_position_scale_mm)
 
         if self.in_channels <= 0:
             raise ValueError(f"in_channels 必须大于 0，但当前为 {self.in_channels}")
@@ -391,9 +455,12 @@ class HybridSwinSDFCoreNet(nn.Module):
             padding=0,
         )
 
-        self.global_position_encoding = (
-            GlobalPositionEncoding3D(channels=self.fusion_channels)
-            if self.use_global_position_encoding
+        self.position_encoding = (
+            PositionEncoding3D(
+                channels=self.fusion_channels,
+                absolute_scale_mm=self.absolute_position_scale_mm,
+            )
+            if self.use_absolute_position_encoding
             else None
         )
 
@@ -482,22 +549,28 @@ class HybridSwinSDFCoreNet(nn.Module):
 
         return feat
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        position_coords: torch.Tensor | None = None,
+        patch_center_dhw: torch.Tensor | None = None,
+        spacing_mm: torch.Tensor | None = None,
+    ) -> Dict[str, torch.Tensor]:
         """
         前向传播。
 
         参数
         ----
         x:
-            输入 CT patch，shape 为 [B, 1, 64, 64, 64]。
+            输入 CT patch，shape 为 [B, 1, 96, 96, 96]。
 
         返回
         ----
         outputs:
             {
-                "mask_logits": [B, 1, 64, 64, 64],
-                "sdf":         [B, 1, 64, 64, 64],
-                "core_logits": [B, 1, 64, 64, 64]
+                "mask_logits": [B, 1, 96, 96, 96],
+                "sdf":         [B, 1, 96, 96, 96],
+                "core_logits": [B, 1, 96, 96, 96]
             }
         """
         self._check_input(x)
@@ -518,8 +591,13 @@ class HybridSwinSDFCoreNet(nn.Module):
         # 投影到 fusion_channels。
         f3d = self.swin_feature_proj(f3d)
 
-        if self.global_position_encoding is not None:
-            f3d = f3d + self.global_position_encoding(f3d)
+        if self.position_encoding is not None:
+            f3d = f3d + self.position_encoding(
+                f3d,
+                position_coords=position_coords,
+                patch_center_dhw=patch_center_dhw,
+                spacing_mm=spacing_mm,
+            )
 
         # 2D 三视角纹理分支。
         f2d = self.projector2d(ct_x)
@@ -570,20 +648,20 @@ class HybridSwinSDFCoreNet(nn.Module):
 
 if __name__ == "__main__":
     # 简单自检：
-    # 输入 [2, 1, 64, 64, 64]，检查三个输出的 shape。
+    # 输入 [2, 1, 96, 96, 96]，检查三个输出的 shape。
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = HybridSwinSDFCoreNet(
-        img_size=(64, 64, 64),
+        img_size=(96, 96, 96),
         in_channels=1,
-        swin_feature_channels=16,
-        two_d_feature_channels=16,
-        fusion_channels=32,
-        feature_size=24,
+        swin_feature_channels=12,
+        two_d_feature_channels=12,
+        fusion_channels=24,
+        feature_size=12,
         use_checkpoint=True,
     ).to(device)
 
-    x = torch.randn(2, 1, 64, 64, 64).to(device)
+    x = torch.randn(2, 1, 96, 96, 96).to(device)
 
     model.eval()
 

@@ -3,79 +3,166 @@ deterministic: false
 
 data:
   data_root: /home/lembert/Desktop/BME-4/BME-WYZ/data_processed/LIDC-IDRI
+  val_data_root: /home/lembert/Desktop/BME-4/BME-WYZ/data_processed/LIDC-IDRI/volumes
   train_csv: train.csv
   val_csv: val.csv
   test_csv: test.csv
+  val_volume_csv: val_volume.csv
+
   auto_split: true
   split_ratios: [0.8, 0.1, 0.1]
   split_dir: outputs/splits
+
   sample_pos_neg_ratio: 3.0
-  input_format: auto
+  input_format: npz_patch
+  val_input_format: npy_volume
+
   cache_dir: outputs/persistent_cache
+  use_persistent_cache: false
+  train_num_workers: 2
+  val_num_workers: 0
+  prefetch_factor: 1
+  persistent_workers: false
+  pin_memory: false
+
   roi_size: [96, 96, 96]
   target_spacing: [1.0, 1.0, 1.0]
+
   intensity_mode: ct
   ct_window: [-1000, 400]
-  profile_ratios: [1, 1, 1, 0.5, 0.5]
+
+  # sample_label:
+  # 0 = 背景
+  # 1 = 普通前景
+  # 2 = 边界 / hard 区域
+  # 3 = 小连通域
+  # 4 = 大连通域
+  #
+  # 原来是 [1, 1, 1, 0.5, 0.5]
+  # 现在保留小/大结节入口，同时提高边界采样权重
+  # volume 裁剪时用于综合背景、普通前景、边界、小结节、大结节；
+  # patch 训练时主要由 CSV 重采样逻辑按 patch_type / nodule_size_class 平衡。
+  profile_ratios: [1, 1, 3, 1, 1]
+
   samples_per_volume: 8
+
+  # 这两个参数影响 sample_label 中 class 3 / class 4 的生成；
+  # 当前 profile_ratios 会保留小/大结节采样入口，但主要训练源仍是 npz patch。
   small_cc_voxels: 128
   large_cc_voxels: 4096
+
   overwrite_aux: false
-  num_workers: 4
+  num_workers: 2
 
 model:
   name: hybrid_swin_sdf_core
   num_classes: 1
+
   img_size: [96, 96, 96]
   in_channels: 1
   ct_in_channels: 1
-  swin_feature_channels: 16
-  two_d_feature_channels: 16
-  fusion_channels: 32
-  feature_size: 24
+
+  swin_feature_channels: 12
+  two_d_feature_channels: 12
+  fusion_channels: 24
+  feature_size: 12
+
   use_checkpoint: true
-  use_global_position_encoding: true
+
+  # 使用你现在模型里的 3D 位置编码
+  use_absolute_position_encoding: true
+  absolute_position_scale_mm: 128.0
 
 loss:
+  # 前 15 epoch 只用 Dice + CE/BCE
   warmup_epochs: 15
+
+  # Stage2 后启用 component_weight
   stage2_start_epoch: 80
+
   dice_weight_start: 1.0
   dice_weight_end: 0.35
+
   ce_weight_start: 1.0
   ce_weight_end: 0.25
+
   tversky_weight_start: 0.0
   tversky_weight_end: 1.2
+
   boundary_weight_start: 0.0
   boundary_weight_end: 0.8
+
   sdf_weight_start: 0.0
   sdf_weight_end: 0.3
+
+  # 暂时关闭 core loss。
+  # 原因：如果当前数据没有真实 core 标签，BuildAuxTargetsd 会补全 0 core，
+  # 继续训练 core_logits 会让它学成全背景。
   core_weight_start: 0.0
-  core_weight_end: 0.3
+  core_weight_end: 0.0
+
+  # 中心损失：warmup 后逐步加入
+  center_weight_start: 0.0
+  center_weight_end: 0.01
+
+  # 关键修改：
+  # 使用 mask_logits 的 soft center，而不是 core_logits。
+  # 这才对应“真实结节中心 vs 最终 3D 预测中心”。
+  center_source: mask
+  center_use_smooth_l1: true
+
+  # Tversky:
+  # alpha 控制 FP 惩罚，beta 控制 FN 惩罚。
+  # beta=0.7 会更偏向减少漏检。
   tversky_alpha: 0.3
   tversky_beta: 0.7
+
   boundary_voxel_boost: 5.0
   dist_sigma: 0.2
+
   stage2_weight_power: 1.0
   max_stage2_weight: 8.0
 
 train:
   epochs: 300
+
   batch_size: 1
+
   lr: 0.0001
   min_lr: 0.000001
   weight_decay: 0.00001
+
   scheduler: cosine
+
   amp: true
+  enforce_24gb_safety: true
+  max_gpu_memory_gb: 24
+
   grad_accum_steps: 4
   grad_clip_norm: 12.0
+
   drop_last: false
 
 eval:
   threshold: 0.5
+  val_interval: 10
+  roi_size: [96, 96, 96]
+  sw_batch_size: 1
+  overlap: 0.0
+  max_cases_per_epoch: 8
+  validate_on_start: false
+  validate_on_final: true
+  compute_soft_dice: false
+  empty_cache: true
+
   spacing: [1.0, 1.0, 1.0]
+
   min_voxels: 16
   min_volume_mm3: null
+
   keep_largest: false
 
 output:
-  output_dir: outputs
+  # 建议新实验单独输出，避免覆盖之前 outputs/checkpoints 里的结果。
+  # 如果你想沿用原来的输出目录，可以改回 outputs。
+  output_dir: outputs_center_mask

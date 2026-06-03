@@ -79,9 +79,11 @@ try:
         infer_input_format,
         load_yaml as train_load_yaml,
         load_checkpoint as train_load_checkpoint,
+        model_position_kwargs,
         normalize_records_for_image_label,
         parse_class_dict_or_scalar,
         read_csv_records,
+        resolve_data_path,
         resolve_existing_path,
         resolve_split_csv_paths,
         resolve_runtime_path,
@@ -308,6 +310,12 @@ def build_model(cfg: Dict[str, Any]) -> HybridSwinSDFCoreNet:
     根据配置构建 HybridSwinSDFCoreNet。
     """
     model_cfg = cfg.get("model", {})
+    use_absolute_position_encoding = bool(
+        model_cfg.get(
+            "use_absolute_position_encoding",
+            model_cfg.get("use_global_position_encoding", True),
+        )
+    )
 
     model = HybridSwinSDFCoreNet(
         img_size=tuple(model_cfg.get("img_size", [64, 64, 64])),
@@ -318,7 +326,8 @@ def build_model(cfg: Dict[str, Any]) -> HybridSwinSDFCoreNet:
         fusion_channels=int(model_cfg.get("fusion_channels", 32)),
         feature_size=int(model_cfg.get("feature_size", 24)),
         use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
-        use_global_position_encoding=bool(model_cfg.get("use_global_position_encoding", True)),
+        use_absolute_position_encoding=use_absolute_position_encoding,
+        absolute_position_scale_mm=float(model_cfg.get("absolute_position_scale_mm", 128.0)),
     )
 
     return model
@@ -383,7 +392,7 @@ def build_test_loader(
     data_cfg = cfg.get("data", {})
     train_cfg = cfg.get("train", {})
 
-    data_root = resolve_runtime_path(data_cfg.get("data_root", DEFAULT_DATA_ROOT))
+    data_root = resolve_data_path(data_cfg.get("data_root", DEFAULT_DATA_ROOT))
     if bool(data_cfg.get("auto_split", False)):
         data_cfg.setdefault("seed", cfg.get("seed", 42))
         data_root, _, _ = resolve_split_csv_paths(data_cfg)
@@ -614,12 +623,13 @@ def evaluate(
         batch = move_batch_to_device(batch, device)
 
         images = batch[IMAGE_KEY].float()
+        position_kwargs = model_position_kwargs(batch)
         masks = batch.get(LABEL_KEY, batch.get(MASK_ALIAS_KEY))
         if masks is None:
             raise KeyError(f"测试 batch 缺少 {LABEL_KEY}/{MASK_ALIAS_KEY} 标签字段。")
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            outputs = model(images)
+            outputs = model(images, **position_kwargs)
 
         if not isinstance(outputs, dict):
             outputs = {"mask_logits": outputs}

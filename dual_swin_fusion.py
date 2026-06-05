@@ -547,6 +547,342 @@ class SwinUnet2D(nn.Module):
         return self.up_x4(x)
 
 
+class SharedSwinEncoder2D(nn.Module):
+    def __init__(
+        self,
+        img_size=(96, 96),
+        patch_size=4,
+        in_channels=1,
+        embed_dim=24,
+        depths=(2, 2, 2, 2),
+        num_heads=(3, 6, 12, 24),
+        window_size=6,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.1,
+    ):
+        super().__init__()
+        self.num_layers = len(depths)
+        self.embed_dim = embed_dim
+        self.patch_embed = PatchEmbed(img_size, patch_size, in_channels, embed_dim)
+        self.patches_resolution = self.patch_embed.patches_resolution
+        self.pos_drop = nn.Dropout(p=drop_rate)
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        self.layers = nn.ModuleList()
+        for layer_idx in range(self.num_layers):
+            dim = int(embed_dim * 2 ** layer_idx)
+            resolution = (
+                self.patches_resolution[0] // (2 ** layer_idx),
+                self.patches_resolution[1] // (2 ** layer_idx),
+            )
+            self.layers.append(
+                BasicLayer(
+                    dim=dim,
+                    input_resolution=resolution,
+                    depth=depths[layer_idx],
+                    num_heads=num_heads[layer_idx],
+                    window_size=window_size,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                    drop_path=dpr[sum(depths[:layer_idx]) : sum(depths[: layer_idx + 1])],
+                    downsample=PatchMerging if layer_idx < self.num_layers - 1 else None,
+                )
+            )
+
+        self.norm = nn.LayerNorm(int(embed_dim * 2 ** (self.num_layers - 1)))
+        self.apply(SwinUnet2D._init_weights)
+
+    def forward(self, x):
+        x = self.patch_embed(x)
+        x = self.pos_drop(x)
+        skips = []
+        for layer in self.layers:
+            skips.append(x)
+            x = layer(x)
+        x = self.norm(x)
+        return x, skips
+
+
+class SwinUnet2DDecoder(nn.Module):
+    def __init__(
+        self,
+        patches_resolution,
+        num_classes=2,
+        embed_dim=24,
+        depths=(2, 2, 2, 2),
+        num_heads=(3, 6, 12, 24),
+        window_size=6,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.1,
+    ):
+        super().__init__()
+        self.num_layers = len(depths)
+        self.patches_resolution = patches_resolution
+
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))]
+        self.layers_up = nn.ModuleList()
+        self.concat_back_dim = nn.ModuleList()
+        for up_idx in range(self.num_layers):
+            source_idx = self.num_layers - 1 - up_idx
+            dim = int(embed_dim * 2 ** source_idx)
+            resolution = (
+                patches_resolution[0] // (2 ** source_idx),
+                patches_resolution[1] // (2 ** source_idx),
+            )
+            if up_idx == 0:
+                self.layers_up.append(PatchExpand(resolution, dim=dim, dim_scale=2))
+                self.concat_back_dim.append(nn.Identity())
+            else:
+                self.concat_back_dim.append(nn.Linear(2 * dim, dim))
+                self.layers_up.append(
+                    BasicLayerUp(
+                        dim=dim,
+                        input_resolution=resolution,
+                        depth=depths[source_idx],
+                        num_heads=num_heads[source_idx],
+                        window_size=window_size,
+                        mlp_ratio=mlp_ratio,
+                        qkv_bias=qkv_bias,
+                        drop=drop_rate,
+                        attn_drop=attn_drop_rate,
+                        drop_path=dpr[sum(depths[:source_idx]) : sum(depths[: source_idx + 1])],
+                        upsample=PatchExpand if up_idx < self.num_layers - 1 else None,
+                    )
+                )
+
+        self.norm_up = nn.LayerNorm(embed_dim)
+        self.up = FinalPatchExpandX4(patches_resolution, dim=embed_dim, dim_scale=4)
+        self.output = nn.Conv2d(embed_dim, num_classes, kernel_size=1, bias=False)
+        self.apply(SwinUnet2D._init_weights)
+
+    def forward_up_features(self, x, skips):
+        for up_idx, layer_up in enumerate(self.layers_up):
+            if up_idx == 0:
+                x = layer_up(x)
+            else:
+                skip = skips[self.num_layers - 1 - up_idx]
+                x = torch.cat([x, skip], dim=-1)
+                x = self.concat_back_dim[up_idx](x)
+                x = layer_up(x)
+        return self.norm_up(x)
+
+    def up_x4(self, x):
+        height, width = self.patches_resolution
+        x = self.up(x)
+        batch, _, channels = x.shape
+        x = x.view(batch, height * 4, width * 4, channels)
+        x = x.permute(0, 3, 1, 2).contiguous()
+        return self.output(x)
+
+    def forward(self, x, skips):
+        x = self.forward_up_features(x, skips)
+        return self.up_x4(x)
+
+
+class SliceToSliceLesionPropagation(nn.Module):
+    """
+    Learnable slice-to-slice lesion propagation over the context-slice axis.
+
+    The module extracts a compact lesion token from each neighboring slice,
+    propagates those tokens with a Transformer encoder, then gates how strongly
+    the propagated lesion evidence is injected back into each slice bottleneck.
+    """
+
+    def __init__(self, context_slices, dim, num_heads=4, depth=1, dropout=0.0):
+        super().__init__()
+        self.context_slices = int(context_slices)
+        heads = max(1, min(int(num_heads), int(dim)))
+        while dim % heads != 0 and heads > 1:
+            heads -= 1
+        self.slice_position = nn.Parameter(torch.zeros(1, self.context_slices, dim))
+        layer = nn.TransformerEncoderLayer(
+            d_model=dim,
+            nhead=heads,
+            dim_feedforward=dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+            norm_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(layer, num_layers=max(1, int(depth)))
+        self.confidence_head = nn.Linear(dim, 1)
+        self.gate = nn.Sequential(
+            nn.Linear(dim * 2 + 1, dim),
+            nn.GELU(),
+            nn.Linear(dim, 1),
+            nn.Sigmoid(),
+        )
+        self.proj = nn.Linear(dim, dim)
+        nn.init.trunc_normal_(self.slice_position, std=0.02)
+
+    def forward(self, tokens):
+        batch, slices, num_tokens, channels = tokens.shape
+        if slices != self.context_slices:
+            raise ValueError(f"Expected {self.context_slices} context slices, got {slices}.")
+
+        lesion_tokens = tokens.mean(dim=2)
+        confidence = torch.sigmoid(self.confidence_head(lesion_tokens))
+        propagated = self.transformer(lesion_tokens + self.slice_position)
+        gate = self.gate(torch.cat([lesion_tokens, propagated, confidence], dim=-1))
+        delta = self.proj(propagated).unsqueeze(2)
+        tokens = tokens + gate.unsqueeze(2) * delta
+        aux = {
+            "slice_propagation_gate": gate.detach(),
+            "slice_propagation_confidence": confidence.detach(),
+        }
+        return tokens, aux
+
+
+class SlicePropagationSwinUnet2D(nn.Module):
+    """
+    Tri-planar 2D Swin-Unet with a shared encoder and plane-specific decoders.
+
+    Each input sample is an odd-K context window. The K slices are encoded with
+    the same 2D Swin encoder, lesion evidence is propagated along the slice axis,
+    and the center slice is decoded by the head for its anatomical plane.
+    """
+
+    uses_plane_heads = True
+
+    def __init__(
+        self,
+        img_size=(96, 96),
+        patch_size=4,
+        context_slices=3,
+        planes=("x", "y", "z"),
+        num_classes=2,
+        embed_dim=24,
+        depths=(2, 2, 2, 2),
+        num_heads=(3, 6, 12, 24),
+        window_size=6,
+        mlp_ratio=4.0,
+        qkv_bias=True,
+        drop_rate=0.0,
+        attn_drop_rate=0.0,
+        drop_path_rate=0.1,
+        propagation_depth=1,
+        propagation_heads=4,
+        propagation_dropout=0.0,
+    ):
+        super().__init__()
+        self.context_slices = int(context_slices)
+        if self.context_slices < 1 or self.context_slices % 2 == 0:
+            raise ValueError("context_slices must be an odd positive integer.")
+        self.center_index = self.context_slices // 2
+        self.planes = tuple(str(plane).lower() for plane in planes)
+        if not self.planes:
+            raise ValueError("At least one 2D plane head is required.")
+
+        self.shared_encoder = SharedSwinEncoder2D(
+            img_size=img_size,
+            patch_size=patch_size,
+            in_channels=1,
+            embed_dim=embed_dim,
+            depths=depths,
+            num_heads=num_heads,
+            window_size=window_size,
+            mlp_ratio=mlp_ratio,
+            qkv_bias=qkv_bias,
+            drop_rate=drop_rate,
+            attn_drop_rate=attn_drop_rate,
+            drop_path_rate=drop_path_rate,
+        )
+        bottleneck_dim = int(embed_dim * 2 ** (len(depths) - 1))
+        self.slice_propagation = SliceToSliceLesionPropagation(
+            context_slices=self.context_slices,
+            dim=bottleneck_dim,
+            num_heads=propagation_heads,
+            depth=propagation_depth,
+            dropout=propagation_dropout,
+        )
+        self.plane_decoders = nn.ModuleDict(
+            {
+                plane: SwinUnet2DDecoder(
+                    patches_resolution=self.shared_encoder.patches_resolution,
+                    num_classes=num_classes,
+                    embed_dim=embed_dim,
+                    depths=depths,
+                    num_heads=num_heads,
+                    window_size=window_size,
+                    mlp_ratio=mlp_ratio,
+                    qkv_bias=qkv_bias,
+                    drop_rate=drop_rate,
+                    attn_drop_rate=attn_drop_rate,
+                    drop_path_rate=drop_path_rate,
+                )
+                for plane in self.planes
+            }
+        )
+
+    def _normalize_planes(self, planes, batch_size):
+        if planes is None:
+            default_plane = "z" if "z" in self.plane_decoders else self.planes[0]
+            return [default_plane] * batch_size
+        if isinstance(planes, str):
+            return [planes.lower()] * batch_size
+        normalized = [str(plane).lower() for plane in planes]
+        if len(normalized) != batch_size:
+            raise ValueError(f"Expected {batch_size} plane labels, got {len(normalized)}.")
+        return normalized
+
+    def _decode_by_plane(self, encoded, skips, planes):
+        outputs = [None] * encoded.shape[0]
+        for plane in sorted(set(planes)):
+            if plane not in self.plane_decoders:
+                raise ValueError(f"Unsupported 2D plane head: {plane}")
+            indices = [idx for idx, item in enumerate(planes) if item == plane]
+            index_tensor = torch.as_tensor(indices, device=encoded.device, dtype=torch.long)
+            plane_encoded = encoded.index_select(0, index_tensor)
+            plane_skips = [skip.index_select(0, index_tensor) for skip in skips]
+            plane_output = self.plane_decoders[plane](plane_encoded, plane_skips)
+            for local_idx, original_idx in enumerate(indices):
+                outputs[original_idx] = plane_output[local_idx : local_idx + 1]
+        return torch.cat(outputs, dim=0)
+
+    def forward(self, x, planes=None, return_aux=False, return_all_slices=False):
+        if x.ndim != 4:
+            raise ValueError(f"Expected input shaped [B, K, H, W], got {tuple(x.shape)}")
+        batch, slices, height, width = x.shape
+        if slices != self.context_slices:
+            raise ValueError(f"Expected {self.context_slices} context channels, got {slices}.")
+
+        flat = x.reshape(batch * slices, 1, height, width)
+        encoded, skips = self.shared_encoder(flat)
+        encoded = encoded.reshape(batch, slices, encoded.shape[1], encoded.shape[2])
+        skips = [
+            skip.reshape(batch, slices, skip.shape[1], skip.shape[2])
+            for skip in skips
+        ]
+        encoded, aux = self.slice_propagation(encoded)
+        plane_labels = self._normalize_planes(planes, batch)
+
+        if return_all_slices:
+            flat_encoded = encoded.reshape(batch * slices, encoded.shape[2], encoded.shape[3])
+            flat_skips = [
+                skip.reshape(batch * slices, skip.shape[2], skip.shape[3])
+                for skip in skips
+            ]
+            flat_planes = [plane for plane in plane_labels for _ in range(slices)]
+            logits = self._decode_by_plane(flat_encoded, flat_skips, flat_planes)
+            logits = logits.reshape(batch, slices, logits.shape[1], logits.shape[2], logits.shape[3])
+        else:
+            center_encoded = encoded[:, self.center_index]
+            center_skips = [skip[:, self.center_index] for skip in skips]
+            logits = self._decode_by_plane(center_encoded, center_skips, plane_labels)
+
+        if return_aux:
+            return {"logits": logits, **aux}
+        return logits
+
+
 def _make_swinunetr(
     spatial_dims,
     in_channels,

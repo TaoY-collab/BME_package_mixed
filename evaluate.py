@@ -52,6 +52,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import yaml
+from monai.inferers import sliding_window_inference
 from tqdm import tqdm
 
 try:
@@ -75,10 +76,12 @@ try:
         DataLoader,
         build_model as train_build_model,
         build_transforms,
+        configure_cuda_memory_limit,
         fast_postprocess_prediction,
         infer_input_format,
         load_yaml as train_load_yaml,
         load_checkpoint as train_load_checkpoint,
+        model_storage_gib,
         normalize_records_for_image_label,
         parse_class_dict_or_scalar,
         read_csv_records,
@@ -107,10 +110,16 @@ METRIC_KEYS = [
 
 
 PER_NODULE_COLUMNS = [
+    "split_name",
+    "input_format",
     "case_id",
     "nodule_id",
+    "threshold",
+    "min_voxels",
     "dice",
+    "post_dice",
     "iou",
+    "post_iou",
     "precision",
     "recall",
     "hd95",
@@ -179,6 +188,11 @@ def parse_args() -> argparse.Namespace:
         help="mask 二值化阈值，默认从配置 eval.threshold 读取，若没有则为 0.5",
     )
 
+    parser.add_argument("--split", choices=["val", "test"], default="test")
+    parser.add_argument("--csv", type=str, default=None)
+    parser.add_argument("--split-name", type=str, default=None)
+    parser.add_argument("--input-format", choices=["auto", "npz_patch", "image_label"], default=None)
+
     return parser.parse_args()
 
 
@@ -212,6 +226,9 @@ def apply_cli_overrides(
 
     if args.threshold is not None:
         cfg["eval"]["threshold"] = float(args.threshold)
+
+    if args.input_format is not None:
+        cfg["data"]["input_format"] = args.input_format
 
     return cfg
 
@@ -270,6 +287,14 @@ def sanitize_filename(text: str) -> str:
     return text
 
 
+def split_label_from_args(args: argparse.Namespace) -> str:
+    if args.split_name is not None and str(args.split_name).strip():
+        return str(args.split_name).strip()
+    if args.csv is not None and str(args.csv).strip():
+        return Path(str(args.csv)).stem
+    return str(args.split)
+
+
 def move_batch_to_device(
     batch: Dict[str, Any],
     device: torch.device,
@@ -313,14 +338,19 @@ def build_model(cfg: Dict[str, Any]) -> HybridSwinSDFCoreNet:
         img_size=tuple(model_cfg.get("img_size", [64, 64, 64])),
         in_channels=int(model_cfg.get("in_channels", 1)),
         ct_in_channels=model_cfg.get("ct_in_channels", None),
-        use_d2_aux_branch=bool(model_cfg.get("use_d2_aux_branch", False)),
-        d2_in_channels=int(model_cfg.get("d2_in_channels", 1)),
-        d2_aux_channels=int(model_cfg.get("d2_aux_channels", model_cfg.get("swin_feature_channels", 16))),
         swin_feature_channels=int(model_cfg.get("swin_feature_channels", 16)),
         two_d_feature_channels=int(model_cfg.get("two_d_feature_channels", 16)),
+        two_d_mode=str(model_cfg.get("two_d_mode", "z_axis_adjacent_triplet")),
+        neighbor_radius=int(model_cfg.get("neighbor_radius", 1)),
         fusion_channels=int(model_cfg.get("fusion_channels", 32)),
-        feature_size=int(model_cfg.get("feature_size", 24)),
+        feature_size=int(model_cfg.get("feature_size", 48)),
         use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
+        use_global_position_encoding=bool(
+            model_cfg.get(
+                "use_global_position_encoding",
+                model_cfg.get("use_absolute_position_encoding", True),
+            )
+        ),
     )
 
     return model
@@ -375,7 +405,10 @@ def load_model_checkpoint(
 
 def build_test_loader(
     cfg: Dict[str, Any],
-) -> torch.utils.data.DataLoader:
+    split: str = "test",
+    csv_override: Optional[str] = None,
+    input_format_override: Optional[str] = None,
+) -> Tuple[torch.utils.data.DataLoader, str, Path]:
     """
     构建测试集 DataLoader。
 
@@ -386,18 +419,35 @@ def build_test_loader(
     train_cfg = cfg.get("train", {})
 
     data_root = resolve_runtime_path(data_cfg.get("data_root", DEFAULT_DATA_ROOT))
-    if bool(data_cfg.get("auto_split", False)):
+    if csv_override is not None and str(csv_override).strip():
+        eval_csv = resolve_csv_path(
+            data_root=data_root,
+            csv_value=csv_override,
+            default_name=Path(str(csv_override)).name,
+        )
+    elif bool(data_cfg.get("auto_split", False)):
         data_cfg.setdefault("seed", cfg.get("seed", 42))
-        data_root, _, _ = resolve_split_csv_paths(data_cfg)
+        data_root, _, val_csv = resolve_split_csv_paths(data_cfg)
+        if split == "val":
+            eval_csv = val_csv
+        else:
+            eval_csv = resolve_csv_path(
+                data_root=data_root,
+                csv_value=data_cfg.get("test_csv", None),
+                default_name="test.csv",
+            )
+    else:
+        csv_key = "val_csv" if split == "val" else "test_csv"
+        default_name = "val.csv" if split == "val" else "test.csv"
+        eval_csv = resolve_csv_path(
+            data_root=data_root,
+            csv_value=data_cfg.get(csv_key, None),
+            default_name=default_name,
+        )
 
-    test_csv = resolve_csv_path(
-        data_root=data_root,
-        csv_value=data_cfg.get("test_csv", None),
-        default_name="test.csv",
-    )
-
-    records = read_csv_records(test_csv, data_root)
-    input_format = infer_input_format(records, data_cfg.get("input_format", "auto"))
+    records = read_csv_records(eval_csv, data_root)
+    configured_format = input_format_override or data_cfg.get("input_format", "auto")
+    input_format = infer_input_format(records, configured_format)
     if input_format == "image_label":
         records = normalize_records_for_image_label(records)
 
@@ -409,8 +459,6 @@ def build_test_loader(
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
-    use_d2 = bool(data_cfg.get("use_d2", False))
-    d2_percentile = float(data_cfg.get("d2_percentile", 99.0))
 
     test_tfms = build_transforms(
         input_format=input_format,
@@ -424,8 +472,6 @@ def build_test_loader(
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=False,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
 
     output_dir = resolve_runtime_path(cfg.get("output", {}).get("output_dir", DEFAULT_OUTPUT_DIR))
@@ -435,16 +481,18 @@ def build_test_loader(
         else output_dir / "persistent_cache"
     )
     ensure_dir(cache_root)
-    cache_tag = f"{input_format}_d2" if use_d2 else input_format
+    cache_tag = input_format
 
     eval_batch_size = cfg.get("eval", {}).get("batch_size", None)
     batch_size = int(eval_batch_size if eval_batch_size is not None else train_cfg.get("batch_size", 1))
+    if input_format == "image_label":
+        batch_size = 1
     num_workers = int(data_cfg.get("num_workers", 4) or 0)
 
     test_dataset = PersistentDataset(
         data=records,
         transform=test_tfms,
-        cache_dir=cache_root / f"test_{cache_tag}",
+        cache_dir=cache_root / f"{sanitize_filename(split)}_{cache_tag}",
     )
 
     test_loader = DataLoader(
@@ -458,9 +506,49 @@ def build_test_loader(
 
     print(f"测试数据格式 input_format = {input_format}")
     print(f"测试样本数：{len(test_dataset)}")
+    print(f"eval split = {split}")
+    print(f"eval CSV = {eval_csv}")
     print(f"PersistentDataset cache_dir = {cache_root}")
 
-    return test_loader
+    return test_loader, input_format, eval_csv
+
+
+def extract_mask_logits(outputs: Any) -> torch.Tensor:
+    if isinstance(outputs, dict):
+        if "mask_logits" not in outputs:
+            raise KeyError("model outputs 缺少 mask_logits")
+        return outputs["mask_logits"]
+    return outputs
+
+
+def run_model_for_batch(
+    model: nn.Module,
+    images: torch.Tensor,
+    input_format: str,
+    roi_size: Sequence[int],
+    sw_batch_size: int,
+    overlap: float,
+) -> Dict[str, torch.Tensor]:
+    if input_format == "image_label":
+        roi = tuple(int(v) for v in roi_size)
+
+        def predictor(window: torch.Tensor) -> torch.Tensor:
+            return extract_mask_logits(model(window))
+
+        mask_logits = sliding_window_inference(
+            images,
+            roi_size=roi,
+            sw_batch_size=max(int(sw_batch_size), 1),
+            predictor=predictor,
+            overlap=float(overlap),
+            mode="gaussian",
+        )
+        return {"mask_logits": mask_logits}
+
+    outputs = model(images)
+    if not isinstance(outputs, dict):
+        return {"mask_logits": outputs}
+    return outputs
 
 
 def tensor_to_numpy(x: torch.Tensor) -> np.ndarray:
@@ -591,6 +679,11 @@ def evaluate(
     min_voxels: Any,
     min_volume_mm3: Any,
     keep_largest: Any,
+    split_name: str,
+    input_format: str,
+    roi_size: Sequence[int],
+    sw_batch_size: int,
+    overlap: float,
 ) -> None:
     """
     在测试集上进行评估。
@@ -598,13 +691,14 @@ def evaluate(
     model.eval()
 
     metrics_dir = output_dir / "metrics"
-    predictions_dir = output_dir / "predictions"
+    safe_split = sanitize_filename(split_name)
+    predictions_dir = output_dir / "predictions" / safe_split
 
     ensure_dir(metrics_dir)
     ensure_dir(predictions_dir)
 
-    per_nodule_csv = metrics_dir / "test_metrics_per_nodule.csv"
-    summary_csv = metrics_dir / "test_metrics_summary.csv"
+    per_nodule_csv = metrics_dir / f"{safe_split}_metrics_per_nodule.csv"
+    summary_csv = metrics_dir / f"{safe_split}_metrics_summary.csv"
 
     per_nodule_rows: List[Dict[str, Any]] = []
     raw_metric_rows: List[Dict[str, float]] = []
@@ -625,10 +719,14 @@ def evaluate(
             raise KeyError(f"测试 batch 缺少 {LABEL_KEY}/{MASK_ALIAS_KEY} 标签字段。")
 
         with torch.cuda.amp.autocast(enabled=amp_enabled):
-            outputs = model(images)
-
-        if not isinstance(outputs, dict):
-            outputs = {"mask_logits": outputs}
+            outputs = run_model_for_batch(
+                model=model,
+                images=images,
+                input_format=input_format,
+                roi_size=roi_size,
+                sw_batch_size=sw_batch_size,
+                overlap=overlap,
+            )
 
         mask_logits = outputs["mask_logits"]
         if num_classes <= 1:
@@ -688,12 +786,18 @@ def evaluate(
             raw_metric_rows.append(metrics)
 
             row = {
+                "split_name": split_name,
+                "input_format": input_format,
                 "case_id": case_id,
                 "nodule_id": nodule_id,
+                "threshold": format_metric_value(threshold),
+                "min_voxels": json.dumps(min_voxels, ensure_ascii=False),
             }
 
             for key in METRIC_KEYS:
                 row[key] = format_metric_value(metrics[key])
+            row["post_dice"] = row["dice"]
+            row["post_iou"] = row["iou"]
 
             per_nodule_rows.append(row)
 
@@ -790,7 +894,6 @@ def main() -> None:
         raise ValueError(f"eval.spacing 必须是长度为 3 的序列，但当前为 {spacing_raw}")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
     amp_requested = bool(train_cfg.get("amp", True))
     amp_enabled = bool(amp_requested and device.type == "cuda")
 
@@ -804,9 +907,24 @@ def main() -> None:
     print(f"threshold：{threshold}")
     print(f"spacing：{spacing}")
 
-    test_loader = build_test_loader(cfg)
+    split_name = split_label_from_args(args)
+    test_loader, input_format, eval_csv = build_test_loader(
+        cfg,
+        split=args.split,
+        csv_override=args.csv,
+        input_format_override=args.input_format,
+    )
+    roi_size = data_cfg.get("roi_size", data_cfg.get("patch_size", [96, 96, 96]))
+    sw_batch_size = int(eval_cfg.get("sw_batch_size", eval_cfg.get("val_sw_batch_size", 1)) or 1)
+    overlap = float(eval_cfg.get("overlap", eval_cfg.get("infer_overlap", 0.5)))
 
-    model = train_build_model(cfg).to(device)
+    model = train_build_model(cfg)
+    print(f"Model parameter/buffer storage: {model_storage_gib(model):.3f} GiB")
+    model = model.to(device)
+    configure_cuda_memory_limit(
+        device,
+        eval_cfg.get("cuda_memory_limit_gb", train_cfg.get("cuda_memory_limit_gb", 24.0)),
+    )
 
     train_load_checkpoint(
         checkpoint_path,
@@ -828,6 +946,11 @@ def main() -> None:
         min_voxels=parse_class_dict_or_scalar(eval_cfg.get("min_voxels", 16)),
         min_volume_mm3=parse_class_dict_or_scalar(eval_cfg.get("min_volume_mm3", None)),
         keep_largest=parse_class_dict_or_scalar(eval_cfg.get("keep_largest", False)),
+        split_name=split_name,
+        input_format=input_format,
+        roi_size=roi_size,
+        sw_batch_size=sw_batch_size,
+        overlap=overlap,
     )
 
 

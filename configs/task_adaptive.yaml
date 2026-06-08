@@ -2,7 +2,8 @@ seed: 42
 deterministic: false
 
 data:
-  data_root: /home/lembert/Desktop/BME-4/BME-WYZ/data_processed/LIDC-IDRI
+  data_root: data
+  all_csv: all_cases.csv
   train_csv: train.csv
   val_csv: val.csv
   test_csv: test.csv
@@ -10,35 +11,34 @@ data:
   split_ratios: [0.8, 0.1, 0.1]
   split_dir: outputs/splits
   sample_pos_neg_ratio: 3.0
-  input_format: auto
+  input_format: image_label
   cache_dir: outputs/persistent_cache
   roi_size: [96, 96, 96]
   target_spacing: [1.0, 1.0, 1.0]
   intensity_mode: ct
   ct_window: [-1000, 400]
   profile_ratios: [1, 1, 1, 0.5, 0.5]
-  samples_per_volume: 8
+  samples_per_volume: 2
+  train_repeat_factor: 2
   small_cc_voxels: 128
   large_cc_voxels: 4096
   overwrite_aux: false
-  use_d2: true
-  d2_percentile: 99.0
   num_workers: 4
 
 model:
   name: hybrid_swin_sdf_core
   num_classes: 1
   img_size: [96, 96, 96]
-  in_channels: 2
+  in_channels: 1
   ct_in_channels: 1
-  use_d2_aux_branch: true
-  d2_in_channels: 1
-  d2_aux_channels: 16
   swin_feature_channels: 16
   two_d_feature_channels: 16
+  two_d_mode: z_axis_adjacent_triplet
+  neighbor_radius: 1
   fusion_channels: 32
-  feature_size: 24
+  feature_size: 48
   use_checkpoint: true
+  use_global_position_encoding: true
 
 loss:
   warmup_epochs: 15
@@ -54,7 +54,11 @@ loss:
   sdf_weight_start: 0.0
   sdf_weight_end: 0.3
   core_weight_start: 0.0
-  core_weight_end: 0.3
+  core_weight_end: 0.0
+  center_weight_start: 0.0
+  center_weight_end: 0.03
+  center_source: mask
+  center_use_smooth_l1: true
   tversky_alpha: 0.3
   tversky_beta: 0.7
   boundary_voxel_boost: 5.0
@@ -70,7 +74,8 @@ train:
   weight_decay: 0.00001
   scheduler: cosine
   amp: true
-  grad_accum_steps: 4
+  cuda_memory_limit_gb: 24.0
+  grad_accum_steps: 8
   grad_clip_norm: 12.0
   drop_last: false
 

@@ -6,7 +6,7 @@ Hybrid-Swin-SDF-CoreNet 项目的 2D-3D 多视角融合模块。
 
 主要功能：
 1. 将 3D 体数据切成 axial、coronal、sagittal 三个方向的 2D 切片；
-2. 使用共享 2D encoder 提取三视角纹理特征；
+2. 使用独立或共享的 2D encoder 提取三视角纹理特征；
 3. 将三视角 2D 特征还原为 3D 特征；
 4. 将三视角特征 concat 后用 1x1x1 Conv3d 压缩通道；
 5. 使用 GatedFusion3D 将 2D 纹理特征和 3D 主干特征进行门控融合。
@@ -20,16 +20,16 @@ Hybrid-Swin-SDF-CoreNet 项目的 2D-3D 多视角融合模块。
 
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 try:
-    from .modules2d import Simple2DTextureEncoder
+    from .modules2d import AdjacentSliceGatedEncoder, Simple2DTextureEncoder
 except ImportError:
-    from modules2d import Simple2DTextureEncoder
+    from modules2d import AdjacentSliceGatedEncoder, Simple2DTextureEncoder
 
 
 def _check_5d_tensor(x: torch.Tensor, name: str = "x") -> None:
@@ -363,7 +363,7 @@ class MultiView2DProjector(nn.Module):
 
     功能：
     1. 将输入 3D 图像切成 axial、coronal、sagittal 三个方向的 2D 切片；
-    2. 使用共享 2D encoder 分别提取三个方向的 2D 纹理特征；
+    2. 使用独立或共享的 2D encoder 提取三个方向的 2D 纹理特征；
     3. 将三方向 2D 特征还原为 [B, C, D, H, W]；
     4. 将三个方向的 3D 特征 concat；
     5. 使用 1x1x1 Conv3d 压缩通道；
@@ -384,6 +384,7 @@ class MultiView2DProjector(nn.Module):
         out_channels: int = 16,
         num_blocks: int = 3,
         negative_slope: float = 0.01,
+        separate_plane_encoders: bool = True,
     ) -> None:
         super().__init__()
 
@@ -392,15 +393,25 @@ class MultiView2DProjector(nn.Module):
         self.encoder_out_channels = int(encoder_out_channels)
         self.out_channels = int(out_channels)
         self.num_blocks = int(num_blocks)
+        self.separate_plane_encoders = bool(separate_plane_encoders)
 
-        # 三个方向共享同一个 2D encoder。
-        self.encoder2d = Simple2DTextureEncoder(
+        encoder_kwargs = dict(
             in_channels=in_channels,
             base_channels=encoder_base_channels,
             out_channels=encoder_out_channels,
             num_blocks=num_blocks,
             negative_slope=negative_slope,
         )
+        if self.separate_plane_encoders:
+            self.encoder2d_axial = Simple2DTextureEncoder(**encoder_kwargs)
+            self.encoder2d_coronal = Simple2DTextureEncoder(**encoder_kwargs)
+            self.encoder2d_sagittal = Simple2DTextureEncoder(**encoder_kwargs)
+            self.encoder2d = None
+        else:
+            self.encoder2d = Simple2DTextureEncoder(**encoder_kwargs)
+            self.encoder2d_axial = None
+            self.encoder2d_coronal = None
+            self.encoder2d_sagittal = None
 
         # 三视角 concat 后通道数为 3 * encoder_out_channels。
         self.channel_compress = nn.Sequential(
@@ -420,6 +431,35 @@ class MultiView2DProjector(nn.Module):
                 negative_slope=negative_slope,
                 inplace=True,
             ),
+        )
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ) -> None:
+        if self.separate_plane_encoders:
+            shared_prefix = prefix + "encoder2d."
+            shared_keys = [key for key in state_dict if key.startswith(shared_prefix)]
+            for shared_key in shared_keys:
+                suffix = shared_key[len(shared_prefix) :]
+                for plane_name in ("axial", "coronal", "sagittal"):
+                    target_key = prefix + f"encoder2d_{plane_name}." + suffix
+                    state_dict.setdefault(target_key, state_dict[shared_key].clone())
+                state_dict.pop(shared_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -448,9 +488,14 @@ class MultiView2DProjector(nn.Module):
 
         axial_slices, coronal_slices, sagittal_slices = make_multiview_slices(x)
 
-        axial_feat_2d = self.encoder2d(axial_slices)
-        coronal_feat_2d = self.encoder2d(coronal_slices)
-        sagittal_feat_2d = self.encoder2d(sagittal_slices)
+        if self.separate_plane_encoders:
+            axial_feat_2d = self.encoder2d_axial(axial_slices)
+            coronal_feat_2d = self.encoder2d_coronal(coronal_slices)
+            sagittal_feat_2d = self.encoder2d_sagittal(sagittal_slices)
+        else:
+            axial_feat_2d = self.encoder2d(axial_slices)
+            coronal_feat_2d = self.encoder2d(coronal_slices)
+            sagittal_feat_2d = self.encoder2d(sagittal_slices)
 
         axial_feat_3d = axial_2d_to_3d(
             feat_2d=axial_feat_2d,
@@ -478,6 +523,105 @@ class MultiView2DProjector(nn.Module):
         out = self.channel_compress(multiview_feat)
 
         return out
+
+
+def make_adjacent_z_triplets(
+    x: torch.Tensor,
+    neighbor_radius: int = 1,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return z/depth-axis triplets as [B*D, C, H, W]."""
+    _check_5d_tensor(x, name="x")
+    radius = int(neighbor_radius)
+    if radius <= 0:
+        raise ValueError(f"neighbor_radius must be positive, got {radius}")
+
+    batch_size, channels, depth, height, width = x.shape
+    indices = torch.arange(depth, device=x.device)
+    previous_indices = torch.clamp(indices - radius, min=0)
+    following_indices = torch.clamp(indices + radius, max=depth - 1)
+
+    def flatten_z(value: torch.Tensor) -> torch.Tensor:
+        return value.permute(0, 2, 1, 3, 4).contiguous().reshape(
+            batch_size * depth,
+            channels,
+            height,
+            width,
+        )
+
+    previous = flatten_z(torch.index_select(x, 2, previous_indices))
+    center = flatten_z(x)
+    following = flatten_z(torch.index_select(x, 2, following_indices))
+    return previous, center, following
+
+
+class ZAxisAdjacent2DProjector(nn.Module):
+    """Build a 3D feature volume from gated z-1/z/z+1 axial slice features."""
+
+    def __init__(
+        self,
+        in_channels: int = 1,
+        encoder_base_channels: int = 16,
+        encoder_out_channels: int = 16,
+        out_channels: int = 16,
+        num_blocks: int = 3,
+        neighbor_radius: int = 1,
+        negative_slope: float = 0.01,
+    ) -> None:
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.encoder_out_channels = int(encoder_out_channels)
+        self.out_channels = int(out_channels)
+        self.neighbor_radius = int(neighbor_radius)
+        self.triplet_encoder = AdjacentSliceGatedEncoder(
+            in_channels=self.in_channels,
+            base_channels=int(encoder_base_channels),
+            out_channels=self.encoder_out_channels,
+            num_blocks=int(num_blocks),
+            negative_slope=float(negative_slope),
+        )
+        self.output_projection = nn.Sequential(
+            nn.Conv3d(
+                self.encoder_out_channels,
+                self.out_channels,
+                kernel_size=1,
+                bias=False,
+            ),
+            nn.InstanceNorm3d(self.out_channels, affine=True),
+            nn.LeakyReLU(negative_slope=float(negative_slope), inplace=True),
+        )
+        self.last_gate_weights: Optional[torch.Tensor] = None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        _check_5d_tensor(x, name="x")
+        batch_size, channels, depth, height, width = x.shape
+        if channels != self.in_channels:
+            raise ValueError(
+                f"ZAxisAdjacent2DProjector expected {self.in_channels} channels, got {channels}"
+            )
+        previous, center, following = make_adjacent_z_triplets(
+            x,
+            neighbor_radius=self.neighbor_radius,
+        )
+        fused_2d, weights = self.triplet_encoder(
+            previous,
+            center,
+            following,
+            return_weights=True,
+        )
+        self.last_gate_weights = weights
+        fused_3d = axial_2d_to_3d(
+            fused_2d,
+            batch_size=batch_size,
+            depth=depth,
+        )
+        if fused_3d.shape[2:] != (depth, height, width):
+            raise RuntimeError(
+                f"adjacent slice feature shape mismatch: {tuple(fused_3d.shape)}"
+            )
+        return self.output_projection(fused_3d)
+
+
+AdjacentAxial2DProjector = ZAxisAdjacent2DProjector
 
 
 class GatedFusion3D(nn.Module):

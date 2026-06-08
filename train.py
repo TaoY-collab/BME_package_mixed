@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import json
 import math
 import os
@@ -37,6 +38,9 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
+
+# Reduce allocator fragmentation for large, varying 3D activation tensors.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import numpy as np
 import torch
@@ -51,6 +55,7 @@ from scipy.ndimage import (
     label as cc_label,
 )
 from torch.optim import AdamW
+from torch.utils.data import Dataset
 from tqdm import tqdm
 
 try:
@@ -102,12 +107,14 @@ LOG_COLUMNS = [
     "train_boundary",
     "train_sdf",
     "train_core",
+    "train_center",
     "w_dice",
     "w_ce",
     "w_tversky",
     "w_boundary",
     "w_sdf",
     "w_core",
+    "w_center",
     "stage2_active",
     "val_dice",
     "val_iou",
@@ -117,6 +124,10 @@ LOG_COLUMNS = [
     "val_pred_voxels",
     "val_post_pred_voxels",
     "val_gt_voxels",
+    "val_pred_gt_ratio",
+    "val_post_pred_gt_ratio",
+    "val_threshold",
+    "val_min_voxels",
     "val_score",
     "epoch_time_sec",
 ]
@@ -124,7 +135,6 @@ LOG_COLUMNS = [
 IMAGE_KEY = "image"
 LABEL_KEY = "label"
 MASK_ALIAS_KEY = "mask"
-D2_KEY = "image_d2"
 
 DEFAULT_CONFIG_PATH = "configs/task_adaptive.yaml"
 DEFAULT_OUTPUT_DIR = "outputs"
@@ -145,19 +155,18 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "split_ratios": [0.8, 0.1, 0.1],
         "split_dir": "outputs/splits",
         "sample_pos_neg_ratio": 3.0,
-        "input_format": "auto",
+        "input_format": "image_label",
         "cache_dir": "outputs/persistent_cache",
         "roi_size": [96, 96, 96],
         "target_spacing": [1.0, 1.0, 1.0],
         "intensity_mode": "ct",
         "ct_window": [-1000, 400],
         "profile_ratios": [1, 1, 1, 0.5, 0.5],
-        "samples_per_volume": 8,
+        "samples_per_volume": 2,
+        "train_repeat_factor": 2,
         "small_cc_voxels": 128,
         "large_cc_voxels": 4096,
         "overwrite_aux": False,
-        "use_d2": False,
-        "d2_percentile": 99.0,
         "num_workers": 4,
     },
     "model": {
@@ -166,14 +175,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "img_size": [96, 96, 96],
         "in_channels": 1,
         "ct_in_channels": 1,
-        "use_d2_aux_branch": False,
-        "d2_in_channels": 1,
-        "d2_aux_channels": 16,
         "swin_feature_channels": 16,
         "two_d_feature_channels": 16,
+        "two_d_mode": "z_axis_adjacent_triplet",
+        "neighbor_radius": 1,
         "fusion_channels": 32,
-        "feature_size": 24,
+        "feature_size": 48,
         "use_checkpoint": True,
+        "use_global_position_encoding": True,
     },
     "loss": {
         "warmup_epochs": 15,
@@ -189,7 +198,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sdf_weight_start": 0.0,
         "sdf_weight_end": 0.3,
         "core_weight_start": 0.0,
-        "core_weight_end": 0.3,
+        "core_weight_end": 0.0,
+        "center_weight_start": 0.0,
+        "center_weight_end": 0.03,
+        "center_source": "mask",
+        "center_use_smooth_l1": True,
         "tversky_alpha": 0.3,
         "tversky_beta": 0.7,
         "boundary_voxel_boost": 5.0,
@@ -205,7 +218,8 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "weight_decay": 0.00001,
         "scheduler": "cosine",
         "amp": True,
-        "grad_accum_steps": 4,
+        "cuda_memory_limit_gb": 24.0,
+        "grad_accum_steps": 8,
         "grad_clip_norm": 12.0,
         "drop_last": False,
     },
@@ -226,6 +240,20 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # 基础工具函数
 # =========================
 
+class RepeatDataset(Dataset):
+    """Repeat a dataset without duplicating MONAI PersistentDataset cache entries."""
+
+    def __init__(self, dataset: Dataset, repeat_factor: int) -> None:
+        self.dataset = dataset
+        self.repeat_factor = max(int(repeat_factor), 1)
+
+    def __len__(self) -> int:
+        return len(self.dataset) * self.repeat_factor
+
+    def __getitem__(self, index: int) -> Any:
+        return self.dataset[index % len(self.dataset)]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train task-adaptive 3D segmentation model.")
 
@@ -238,6 +266,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--resume", type=str, default=None)
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--amp", type=str, default=None, choices=["true", "false"])
+    parser.add_argument("--cuda-memory-limit-gb", type=float, default=None)
 
     return parser.parse_args()
 
@@ -263,10 +292,8 @@ def is_within_project(path: Union[str, Path]) -> bool:
 
 
 def require_project_path(path: Union[str, Path], label: str = "path") -> Path:
-    resolved = Path(path).expanduser().resolve()
-    if not is_within_project(resolved):
-        raise ValueError(f"{label} 必须位于项目目录内：{PROJECT_ROOT}，当前为：{resolved}")
-    return resolved
+    del label
+    return Path(os.path.expandvars(str(path))).expanduser().resolve()
 
 
 def _candidate_base_dirs(
@@ -286,7 +313,7 @@ def path_candidates(
     value: Union[str, Path],
     base_dirs: Optional[Sequence[Union[str, Path]]] = None,
 ) -> List[Path]:
-    raw = Path(str(value)).expanduser()
+    raw = Path(os.path.expandvars(str(value))).expanduser()
     if raw.is_absolute():
         return [require_project_path(raw)]
     return [require_project_path(base / raw) for base in _candidate_base_dirs(base_dirs)]
@@ -315,7 +342,7 @@ def resolve_runtime_path(
     Resolve output/cache/data roots. Relative defaults are anchored at the
     project root, not at src/, so IDE working-directory changes do not move them.
     """
-    raw = Path(str(value)).expanduser()
+    raw = Path(os.path.expandvars(str(value))).expanduser()
     if raw.is_absolute():
         return require_project_path(raw)
     base = Path(str(base_dir)).expanduser() if base_dir is not None else PROJECT_ROOT
@@ -340,7 +367,16 @@ def load_yaml(path: Union[str, Path]) -> Dict[str, Any]:
         return {}
     if not isinstance(cfg, dict):
         raise ValueError(f"配置文件顶层必须是 dict，但当前是 {type(cfg)}")
-    return cfg
+    def expand_value(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {key: expand_value(item) for key, item in value.items()}
+        if isinstance(value, list):
+            return [expand_value(item) for item in value]
+        if isinstance(value, str):
+            return os.path.expandvars(os.path.expanduser(value))
+        return value
+
+    return expand_value(cfg)
 
 
 def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[str, Any]:
@@ -362,6 +398,8 @@ def apply_cli_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dict[s
         cfg["data"]["num_workers"] = int(args.num_workers)
     if args.amp is not None:
         cfg["train"]["amp"] = args.amp.lower() == "true"
+    if args.cuda_memory_limit_gb is not None:
+        cfg["train"]["cuda_memory_limit_gb"] = float(args.cuda_memory_limit_gb)
     if args.resume is not None:
         cfg["train"]["resume"] = args.resume
 
@@ -387,7 +425,7 @@ def set_seed(seed: int = 42, deterministic: bool = False) -> None:
 
 
 def resolve_path(value: Union[str, Path], base_dir: Optional[Path] = None) -> Path:
-    p = Path(str(value)).expanduser()
+    p = Path(os.path.expandvars(str(value))).expanduser()
     if p.is_absolute():
         return require_project_path(p)
     if base_dir is not None:
@@ -627,6 +665,56 @@ def build_auto_split_csvs(
     return out_train, out_val, out_test
 
 
+def discover_nifti_records(data_root: Path) -> List[Dict[str, Any]]:
+    """Discover paired NIfTI image and mask files below data_root."""
+    records: List[Dict[str, Any]] = []
+    for image_path in sorted(data_root.rglob("*_img.nii.gz")):
+        label_path = image_path.with_name(
+            image_path.name.replace("_img.nii.gz", "_mask.nii.gz")
+        )
+        if not label_path.exists():
+            continue
+        case_id = image_path.name[: -len("_img.nii.gz")]
+        match = re.search(r"LIDC-IDRI-\d+", case_id)
+        patient_id = match.group(0) if match else case_id.split("_")[0]
+        records.append(
+            {
+                "image": str(image_path.resolve()),
+                "label": str(label_path.resolve()),
+                "patient_id": patient_id,
+                "case_id": case_id,
+            }
+        )
+    return records
+
+
+def ensure_nifti_manifest(data_cfg: Dict[str, Any], data_root: Path) -> Optional[Path]:
+    all_csv = data_cfg.get("all_csv", None)
+    if all_csv is not None and str(all_csv).strip():
+        configured = resolve_path(all_csv, data_root)
+        if configured.exists():
+            return configured
+
+    default_manifest = data_root / "all_cases.csv"
+    if default_manifest.exists():
+        data_cfg["all_csv"] = str(default_manifest)
+        return default_manifest
+
+    records = discover_nifti_records(data_root)
+    if not records:
+        return None
+    split_dir = resolve_runtime_path(data_cfg.get("split_dir", "outputs/splits"))
+    manifest = split_dir / "all_cases_discovered.csv"
+    write_raw_csv_rows(
+        manifest,
+        records,
+        ["image", "label", "patient_id", "case_id"],
+    )
+    data_cfg["all_csv"] = str(manifest)
+    print(f"Discovered NIfTI cases: {len(records)} | manifest={manifest}")
+    return manifest
+
+
 def is_positive_record(row: Dict[str, Any]) -> Optional[bool]:
     value = row.get("sample_label", None)
     if value is None or str(value).strip() == "":
@@ -716,6 +804,7 @@ def resolve_split_csv_paths(data_cfg: Dict[str, Any]) -> Tuple[Path, Path, Path]
     test_csv = resolve_path(test_csv_value, data_root)
 
     if bool(data_cfg.get("auto_split", False)):
+        ensure_nifti_manifest(data_cfg, data_root)
         split_train, split_val, split_test = build_auto_split_csvs(data_cfg, data_root, train_csv, val_csv, test_csv)
         data_cfg["train_csv"] = str(split_train)
         data_cfg["val_csv"] = str(split_val)
@@ -885,6 +974,8 @@ class LoadNPZPatchd(MapTransform):
                 d["boundary"] = _ensure_channel_first_np(npz["boundary"], "boundary").astype(np.float32)
             if "core" in keys:
                 d["core"] = _ensure_channel_first_np(npz["core"], "core").astype(np.float32)
+            if "sample_label" in keys and "sample_label" not in d:
+                d["sample_label"] = float(np.asarray(npz["sample_label"]).reshape(-1)[0])
 
         d.setdefault("case_id", npz_path.stem)
         d.setdefault("nodule_id", "")
@@ -903,93 +994,6 @@ class EnsureMaskAliasd(MapTransform):
         if self.label_key != LABEL_KEY:
             d[LABEL_KEY] = d[self.label_key]
         d[MASK_ALIAS_KEY] = d[LABEL_KEY]
-        return d
-
-
-class ComputeSecondOrderDiffd(MapTransform):
-    """
-    Build a z-axis second-order difference map from the normalized CT image.
-
-    Expected image shape after EnsureChannelFirstd / LoadNPZPatchd:
-        [C, D, H, W]
-    The D dimension is the slice direction after Orientationd + Spacingd.
-    """
-
-    def __init__(
-        self,
-        image_key: str = IMAGE_KEY,
-        out_key: str = D2_KEY,
-        percentile: float = 99.0,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__(keys=[image_key], allow_missing_keys=False)
-        self.image_key = image_key
-        self.out_key = out_key
-        self.percentile = float(percentile)
-        self.eps = float(eps)
-
-    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        d = dict(data)
-        image = np.asarray(d[self.image_key], dtype=np.float32)
-
-        if image.ndim == 3:
-            image = image[None]
-        if image.ndim != 4:
-            raise ValueError(
-                f"{self.image_key} must be [D,H,W] or [C,D,H,W] before D2, "
-                f"got shape={image.shape}"
-            )
-
-        d2 = np.zeros_like(image, dtype=np.float32)
-        depth = int(image.shape[1])
-
-        if depth >= 3:
-            d2[:, 1:-1] = np.abs(image[:, 2:] - 2.0 * image[:, 1:-1] + image[:, :-2])
-            d2[:, 0] = d2[:, 1]
-            d2[:, -1] = d2[:, -2]
-        elif depth == 2:
-            first_diff = np.abs(image[:, 1] - image[:, 0])
-            d2[:, 0] = first_diff
-            d2[:, 1] = first_diff
-
-        p = float(np.percentile(d2, self.percentile)) if d2.size > 0 else 0.0
-        if np.isfinite(p) and p > self.eps:
-            d2 = np.clip(d2, 0.0, p) / p
-        else:
-            d2 = np.zeros_like(d2, dtype=np.float32)
-
-        d[self.out_key] = d2.astype(np.float32, copy=False)
-        return d
-
-
-class MergeD2ToImaged(MapTransform):
-    """Concatenate CT and D2 channels only after spatial and CT intensity augments."""
-
-    def __init__(
-        self,
-        image_key: str = IMAGE_KEY,
-        d2_key: str = D2_KEY,
-    ) -> None:
-        super().__init__(keys=[image_key, d2_key], allow_missing_keys=False)
-        self.image_key = image_key
-        self.d2_key = d2_key
-
-    def __call__(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        d = dict(data)
-        image = d[self.image_key]
-        d2 = d[self.d2_key]
-
-        if torch.is_tensor(image):
-            if not torch.is_tensor(d2):
-                d2 = torch.as_tensor(d2, dtype=image.dtype, device=image.device)
-            else:
-                d2 = d2.to(dtype=image.dtype, device=image.device)
-            d[self.image_key] = torch.cat([image, d2], dim=0)
-            return d
-
-        image_np = np.asarray(image, dtype=np.float32)
-        d2_np = np.asarray(d2, dtype=np.float32)
-        d[self.image_key] = np.concatenate([image_np, d2_np], axis=0).astype(np.float32, copy=False)
         return d
 
 
@@ -1137,14 +1141,11 @@ def build_transforms(
     large_cc_voxels: int,
     overwrite_aux: bool,
     is_train: bool,
-    use_d2: bool = False,
-    d2_percentile: float = 99.0,
 ) -> Compose:
     roi_size = tuple(int(v) for v in roi_size)
     target_spacing = tuple(float(v) for v in target_spacing)
     profile_ratios = list(float(v) for v in profile_ratios)
-    use_d2 = bool(use_d2)
-    rotate_spatial_axes = (1, 2) if use_d2 else (0, 1)
+    rotate_spatial_axes = (0, 1)
 
     aux_builder = BuildAuxTargetsd(
         label_key=LABEL_KEY,
@@ -1156,13 +1157,9 @@ def build_transforms(
     if input_format == "npz_patch":
         keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "sdf", "dist_map", "boundary", "core", "component_weight", "sample_label"]
         spatial_keys = list(keys)
-        if use_d2:
-            spatial_keys.append(D2_KEY)
         transforms: List[Any] = [
             LoadNPZPatchd(npz_key="npz_path"),
         ]
-        if use_d2:
-            transforms.append(ComputeSecondOrderDiffd(percentile=d2_percentile))
         transforms += [
             EnsureMaskAliasd(label_key=LABEL_KEY),
             aux_builder,
@@ -1181,8 +1178,6 @@ def build_transforms(
                 RandScaleIntensityd(keys=[IMAGE_KEY], factors=0.10, prob=0.30),
                 RandShiftIntensityd(keys=[IMAGE_KEY], offsets=0.10, prob=0.30),
             ]
-        if use_d2:
-            transforms.append(MergeD2ToImaged())
         return Compose(transforms)
 
     if input_format != "image_label":
@@ -1193,8 +1188,6 @@ def build_transforms(
 
     base_keys = [IMAGE_KEY, label_source_key]
     crop_keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "sdf", "dist_map", "boundary", "core", "component_weight", "sample_label"]
-    if use_d2:
-        crop_keys.append(D2_KEY)
 
     deterministic: List[Any] = [
         LoadImaged(keys=base_keys),
@@ -1230,13 +1223,10 @@ def build_transforms(
             )
         )
 
-    if use_d2:
-        deterministic.append(ComputeSecondOrderDiffd(percentile=d2_percentile))
-
     deterministic += [
         EnsureMaskAliasd(label_key=LABEL_KEY),
         CropForegroundd(
-            keys=[IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY] + ([D2_KEY] if use_d2 else []),
+            keys=[IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY],
             source_key=IMAGE_KEY,
             margin=8,
             allow_smaller=True,
@@ -1246,8 +1236,6 @@ def build_transforms(
     ]
 
     if not is_train:
-        if use_d2:
-            deterministic.append(MergeD2ToImaged())
         return Compose(deterministic)
 
     random_part = [
@@ -1269,9 +1257,6 @@ def build_transforms(
         RandScaleIntensityd(keys=[IMAGE_KEY], factors=0.10, prob=0.30),
         RandShiftIntensityd(keys=[IMAGE_KEY], offsets=0.10, prob=0.30),
     ]
-
-    if use_d2:
-        random_part.append(MergeD2ToImaged())
 
     return Compose(deterministic + random_part)
 
@@ -1314,12 +1299,11 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     intensity_mode = data_cfg.get("intensity_mode", "ct")
     ct_window = data_cfg.get("ct_window", [-1000.0, 400.0])
     profile_ratios = data_cfg.get("profile_ratios", [1, 1, 1, 0.5, 0.5])
-    samples_per_volume = int(data_cfg.get("samples_per_volume", 8))
+    samples_per_volume = int(data_cfg.get("samples_per_volume", 2))
+    train_repeat_factor = max(int(data_cfg.get("train_repeat_factor", 1) or 1), 1)
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
-    use_d2 = bool(data_cfg.get("use_d2", False))
-    d2_percentile = float(data_cfg.get("d2_percentile", 99.0))
 
     train_tfms = build_transforms(
         input_format=input_format,
@@ -1333,8 +1317,6 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=True,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
     val_tfms = build_transforms(
         input_format=input_format,
@@ -1348,8 +1330,6 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=False,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
 
     output_dir = resolve_runtime_path(cfg.get("output", {}).get("output_dir", DEFAULT_OUTPUT_DIR))
@@ -1360,12 +1340,17 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     )
     ensure_dir(cache_root)
 
-    cache_tag = f"{input_format}_d2" if use_d2 else input_format
+    cache_tag = input_format
 
-    train_ds = PersistentDataset(
+    base_train_ds = PersistentDataset(
         data=train_records,
         transform=train_tfms,
         cache_dir=cache_root / f"train_{cache_tag}",
+    )
+    train_ds = (
+        RepeatDataset(base_train_ds, train_repeat_factor)
+        if train_repeat_factor > 1
+        else base_train_ds
     )
     val_ds = PersistentDataset(
         data=val_records,
@@ -1399,7 +1384,12 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     )
 
     print(f"数据格式 input_format = {input_format}")
-    print(f"训练样本数：{len(train_ds)}，验证样本数：{len(val_ds)}")
+    print(
+        "训练样本数："
+        f"base={len(base_train_ds)}, repeat_factor={train_repeat_factor}, "
+        f"loader_items={len(train_ds)}, dynamic_patches_per_epoch={len(train_ds) * samples_per_volume}，"
+        f"验证样本数：{len(val_ds)}"
+    )
     print(f"PersistentDataset cache_dir = {cache_root}")
 
     return train_loader, val_loader, input_format
@@ -1465,14 +1455,19 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
                 img_size=tuple(int(v) for v in img_size),
                 in_channels=int(model_cfg.get("in_channels", 1)),
                 ct_in_channels=model_cfg.get("ct_in_channels", None),
-                use_d2_aux_branch=bool(model_cfg.get("use_d2_aux_branch", False)),
-                d2_in_channels=int(model_cfg.get("d2_in_channels", 1)),
-                d2_aux_channels=int(model_cfg.get("d2_aux_channels", model_cfg.get("swin_feature_channels", 16))),
                 swin_feature_channels=int(model_cfg.get("swin_feature_channels", 16)),
                 two_d_feature_channels=int(model_cfg.get("two_d_feature_channels", 16)),
+                two_d_mode=str(model_cfg.get("two_d_mode", "z_axis_adjacent_triplet")),
+                neighbor_radius=int(model_cfg.get("neighbor_radius", 1)),
                 fusion_channels=int(model_cfg.get("fusion_channels", 32)),
-                feature_size=int(model_cfg.get("feature_size", 24)),
+                feature_size=int(model_cfg.get("feature_size", 48)),
                 use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
+                use_global_position_encoding=bool(
+                    model_cfg.get(
+                        "use_global_position_encoding",
+                        model_cfg.get("use_absolute_position_encoding", True),
+                    )
+                ),
             )
 
     if name in {"swinunetr", "generic_swinunetr", "swin_unetr"} or HybridSwinSDFCoreNet is None:
@@ -1491,6 +1486,7 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
 # 动态对抗 Loss
 # =========================
 
+import losses as losses_module
 from losses import AdaptiveDynamicSegLoss
 
 
@@ -1514,6 +1510,9 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
       sdf_weight_end: 0.3
       core_weight_start: 0.0
       core_weight_end: 0.3
+      center_weight_start: 0.0
+      center_weight_end: 0.03
+      center_source: mask
       tversky_alpha: 0.3
       tversky_beta: 0.7
     """
@@ -1521,7 +1520,7 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
     train_cfg = cfg.get("train", {})
     loss_cfg = cfg.get("loss", {})
 
-    return AdaptiveDynamicSegLoss(
+    criterion_kwargs = dict(
         num_classes=int(model_cfg.get("num_classes", 1)),
         max_epochs=int(train_cfg.get("epochs", 300)),
         warmup_epochs=int(loss_cfg.get("warmup_epochs", 15)),
@@ -1539,6 +1538,10 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
         sdf_weight_end=float(loss_cfg.get("sdf_weight_end", 0.3)),
         core_weight_start=float(loss_cfg.get("core_weight_start", 0.0)),
         core_weight_end=float(loss_cfg.get("core_weight_end", 0.3)),
+        center_weight_start=float(loss_cfg.get("center_weight_start", 0.0)),
+        center_weight_end=float(loss_cfg.get("center_weight_end", 0.03)),
+        center_source=str(loss_cfg.get("center_source", "mask")),
+        center_use_smooth_l1=bool(loss_cfg.get("center_use_smooth_l1", True)),
         tversky_alpha=float(loss_cfg.get("tversky_alpha", 0.3)),
         tversky_beta=float(loss_cfg.get("tversky_beta", 0.7)),
         boundary_voxel_boost=float(loss_cfg.get("boundary_voxel_boost", 5.0)),
@@ -1546,6 +1549,17 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
         stage2_weight_power=float(loss_cfg.get("stage2_weight_power", 1.0)),
         max_stage2_weight=float(loss_cfg.get("max_stage2_weight", 8.0)),
     )
+    supported = set(inspect.signature(AdaptiveDynamicSegLoss.__init__).parameters)
+    missing = sorted(set(criterion_kwargs) - supported)
+    if missing:
+        losses_path = Path(getattr(losses_module, "__file__", "losses.py")).resolve()
+        raise RuntimeError(
+            "train.py and losses.py are from different code versions. "
+            f"AdaptiveDynamicSegLoss is missing arguments: {missing}. "
+            f"Imported losses.py: {losses_path}. "
+            "Upload the matching losses.py together with train.py, then restart."
+        )
+    return AdaptiveDynamicSegLoss(**criterion_kwargs)
 
 
 # =========================
@@ -1557,6 +1571,49 @@ class AMPPolicy:
     enabled: bool
     dtype: torch.dtype
     scaler: Optional[torch.cuda.amp.GradScaler]
+
+
+def configure_cuda_memory_limit(
+    device: torch.device,
+    limit_gb: Optional[float],
+) -> Optional[float]:
+    if device.type != "cuda" or limit_gb is None:
+        return None
+
+    limit_gb = float(limit_gb)
+    if limit_gb <= 0.0:
+        return None
+
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+
+    props = torch.cuda.get_device_properties(device_index)
+    total_gb = float(props.total_memory) / float(1024 ** 3)
+    if total_gb <= 0.0:
+        return None
+
+    fraction = min(max(limit_gb / total_gb, 0.0), 1.0)
+    if fraction < 1.0:
+        torch.cuda.set_per_process_memory_fraction(fraction, device=device_index)
+        print(
+            "CUDA memory cap enabled: "
+            f"limit={limit_gb:.2f} GB | visible_total={total_gb:.2f} GB | fraction={fraction:.4f}"
+        )
+    else:
+        print(
+            "CUDA memory cap not applied: "
+            f"requested_limit={limit_gb:.2f} GB >= visible_total={total_gb:.2f} GB"
+        )
+    return fraction
+
+
+def model_storage_gib(model: nn.Module) -> float:
+    storage_bytes = sum(
+        tensor.numel() * tensor.element_size()
+        for tensor in list(model.parameters()) + list(model.buffers())
+    )
+    return float(storage_bytes) / float(1024 ** 3)
 
 
 def build_amp_policy(device: torch.device, requested: bool = True) -> AMPPolicy:
@@ -1760,6 +1817,8 @@ def train_one_epoch(
     model.train()
     optimizer.zero_grad(set_to_none=True)
     accum_steps = max(int(accum_steps), 1)
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats(device)
 
     loss_sums = {
         "total": 0.0,
@@ -1769,12 +1828,14 @@ def train_one_epoch(
         "boundary": 0.0,
         "sdf": 0.0,
         "core": 0.0,
+        "center": 0.0,
         "w_dice": 0.0,
         "w_ce": 0.0,
         "w_tversky": 0.0,
         "w_boundary": 0.0,
         "w_sdf": 0.0,
         "w_core": 0.0,
+        "w_center": 0.0,
         "stage2_active": 0.0,
     }
     count = 0
@@ -1814,14 +1875,25 @@ def train_one_epoch(
         for k in loss_sums.keys():
             loss_sums[k] += float(loss_dict.get(k, torch.tensor(0.0)).detach().cpu()) * bs
 
-        progress.set_postfix({
+        postfix = {
             "loss": f"{float(loss.detach().cpu()):.4f}",
             "dice_l": f"{float(loss_dict['dice'].detach().cpu()):.4f}",
+            "ctr": f"{float(loss_dict.get('center', torch.tensor(0.0)).detach().cpu()):.4f}",
             "w_ce": f"{float(loss_dict.get('w_ce', torch.tensor(0.0)).detach().cpu()):.3f}",
             "w_bnd": f"{float(loss_dict.get('w_boundary', torch.tensor(0.0)).detach().cpu()):.3f}",
-        })
+        }
+        if device.type == "cuda":
+            postfix["gpu_gb"] = (
+                f"{torch.cuda.memory_allocated(device) / (1024 ** 3):.1f}/"
+                f"{torch.cuda.memory_reserved(device) / (1024 ** 3):.1f}"
+            )
+        progress.set_postfix(postfix)
 
-    return average_loss_dict(loss_sums, count)
+    averaged = average_loss_dict(loss_sums, count)
+    if device.type == "cuda":
+        averaged["peak_allocated_gb"] = torch.cuda.max_memory_allocated(device) / (1024 ** 3)
+        averaged["peak_reserved_gb"] = torch.cuda.max_memory_reserved(device) / (1024 ** 3)
+    return averaged
 
 
 @torch.no_grad()
@@ -1891,7 +1963,6 @@ def validate(
                 "gt_voxels": float(np.sum(np.asarray(gt_i) > 0)),
             }
             rows.append(metrics)
-
         if rows:
             progress.set_postfix({
                 "raw_dice": f"{np.mean([r['dice'] for r in rows]):.4f}",
@@ -1899,17 +1970,28 @@ def validate(
             })
 
     if not rows:
-        return {"dice": 0.0, "iou": 0.0, "score": 0.0}
+        return {
+            "dice": 0.0,
+            "iou": 0.0,
+            "score": 0.0,
+        }
 
+    pred_voxels = float(np.mean([r["pred_voxels"] for r in rows]))
+    post_pred_voxels = float(np.mean([r["post_pred_voxels"] for r in rows]))
+    gt_voxels = float(np.mean([r["gt_voxels"] for r in rows]))
+    pred_gt_ratio = pred_voxels / max(gt_voxels, 1e-8)
+    post_pred_gt_ratio = post_pred_voxels / max(gt_voxels, 1e-8)
     return {
         "dice": float(np.mean([r["dice"] for r in rows])),
         "iou": float(np.mean([r["iou"] for r in rows])),
         "soft_dice": float(np.nanmean([r["soft_dice"] for r in rows])),
         "post_dice": float(np.mean([r["post_dice"] for r in rows])),
         "post_iou": float(np.mean([r["post_iou"] for r in rows])),
-        "pred_voxels": float(np.mean([r["pred_voxels"] for r in rows])),
-        "post_pred_voxels": float(np.mean([r["post_pred_voxels"] for r in rows])),
-        "gt_voxels": float(np.mean([r["gt_voxels"] for r in rows])),
+        "pred_voxels": pred_voxels,
+        "post_pred_voxels": post_pred_voxels,
+        "gt_voxels": gt_voxels,
+        "pred_gt_ratio": float(pred_gt_ratio),
+        "post_pred_gt_ratio": float(post_pred_gt_ratio),
         "score": float(np.mean([r["score"] for r in rows])),
     }
 
@@ -1925,6 +2007,11 @@ def save_checkpoint(
 ) -> None:
     ensure_dir(path.parent)
     payload = {
+        "architecture_version": getattr(
+            model,
+            "ARCHITECTURE_VERSION",
+            "generic_swinunetr_v1",
+        ),
         "epoch": int(epoch),
         "best_score": float(best_score),
         "model_state_dict": model.state_dict(),
@@ -1946,25 +2033,32 @@ def load_checkpoint(
     if not path.exists():
         raise FileNotFoundError(f"找不到 checkpoint：{path}")
     checkpoint = torch.load(path, map_location=device or "cpu")
+    expected_version = getattr(
+        model,
+        "ARCHITECTURE_VERSION",
+        "generic_swinunetr_v1",
+    )
 
     if isinstance(checkpoint, dict) and "model_state_dict" in checkpoint:
+        checkpoint_version = checkpoint.get("architecture_version", None)
+        if checkpoint_version != expected_version:
+            raise RuntimeError(
+                "Checkpoint architecture is incompatible with the current model. "
+                f"Expected {expected_version!r}, got {checkpoint_version!r}. "
+                "The Z-axis-only feature_size=48 model must start a new experiment."
+            )
         state = strip_module_prefix(checkpoint["model_state_dict"])
-        model.load_state_dict(state, strict=False)
+        model.load_state_dict(state, strict=True)
         if optimizer is not None and "optimizer_state_dict" in checkpoint:
             optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         if scheduler is not None and "scheduler_state_dict" in checkpoint:
             scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
         return int(checkpoint.get("epoch", 0)), float(checkpoint.get("best_score", -1.0))
 
-    if isinstance(checkpoint, dict) and "state_dict" in checkpoint:
-        model.load_state_dict(strip_module_prefix(checkpoint["state_dict"]), strict=False)
-        return 0, -1.0
-
-    if isinstance(checkpoint, dict):
-        model.load_state_dict(strip_module_prefix(checkpoint), strict=False)
-        return 0, -1.0
-
-    raise RuntimeError(f"无法识别 checkpoint 格式：{path}")
+    raise RuntimeError(
+        f"无法识别或拒绝旧 checkpoint 格式：{path}。"
+        "当前架构要求包含 architecture_version 的完整 checkpoint。"
+    )
 
 
 def build_optimizer_and_scheduler(cfg: Dict[str, Any], model: nn.Module) -> Tuple[torch.optim.Optimizer, Optional[Any]]:
@@ -2011,12 +2105,23 @@ def main() -> None:
     best_path = ckpt_dir / "best_dice.pt"
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"使用设备：{device}")
-
+    gpu_name = torch.cuda.get_device_name(0) if device.type == "cuda" else "CPU"
+    gpu_memory_gb = (
+        torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        if device.type == "cuda"
+        else 0.0
+    )
+    print(
+        f"使用设备：{device} | name={gpu_name} | memory_gb={gpu_memory_gb:.1f}"
+    )
     train_loader, val_loader, input_format = build_loaders(cfg)
 
-    model = build_model(cfg).to(device)
+    model = build_model(cfg)
+    print(f"Model parameter/buffer storage: {model_storage_gib(model):.3f} GiB")
+    # Let CUDA finish lazy initialization before applying a fractional cap.
+    model = model.to(device)
     criterion = build_criterion(cfg).to(device)
+    configure_cuda_memory_limit(device, train_cfg.get("cuda_memory_limit_gb", 24.0))
     optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
 
     amp_policy = build_amp_policy(device, requested=bool(train_cfg.get("amp", True)))
@@ -2055,13 +2160,39 @@ def main() -> None:
     init_csv_log(log_path, resume=resume_flag)
 
     print("训练配置摘要：")
+    loader_batch_size = int(train_cfg.get("batch_size", 1) or 1)
+    samples_per_volume = (
+        int(data_cfg.get("samples_per_volume", 1) or 1)
+        if input_format == "image_label"
+        else 1
+    )
+    train_repeat_factor = max(int(data_cfg.get("train_repeat_factor", 1) or 1), 1)
     print(json.dumps({
+        "architecture_version": getattr(
+            model,
+            "ARCHITECTURE_VERSION",
+            "generic_swinunetr_v1",
+        ),
         "input_format": input_format,
+        "roi_size": data_cfg.get("roi_size", [96, 96, 96]),
+        "feature_size": int(model_cfg.get("feature_size", 48)),
+        "swin_feature_channels": int(model_cfg.get("swin_feature_channels", 16)),
+        "two_d_feature_channels": int(model_cfg.get("two_d_feature_channels", 16)),
+        "fusion_channels": int(model_cfg.get("fusion_channels", 32)),
+        "two_d_mode": model_cfg.get("two_d_mode", "z_axis_adjacent_triplet"),
+        "neighbor_radius": int(model_cfg.get("neighbor_radius", 1)),
         "epochs": epochs,
-        "batch_size": int(train_cfg.get("batch_size", 1) or 1),
+        "batch_size": loader_batch_size,
+        "samples_per_volume": samples_per_volume,
+        "train_repeat_factor": train_repeat_factor,
+        "effective_patch_batch": loader_batch_size * samples_per_volume,
         "grad_accum_steps": accum_steps,
+        "effective_optimizer_patch_batch": loader_batch_size * samples_per_volume * accum_steps,
+        "dynamic_patches_per_epoch": len(train_loader.dataset) * samples_per_volume,
         "num_classes": num_classes,
         "amp": bool(train_cfg.get("amp", True)),
+        "cuda_memory_limit_gb": train_cfg.get("cuda_memory_limit_gb", 24.0),
+        "cuda_allocator_config": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         "threshold": threshold,
         "min_voxels": min_voxels,
         "min_volume_mm3": min_volume_mm3,
@@ -2135,12 +2266,14 @@ def main() -> None:
             "train_boundary": format_float(train_losses["boundary"]),
             "train_sdf": format_float(train_losses["sdf"]),
             "train_core": format_float(train_losses["core"]),
+            "train_center": format_float(train_losses["center"]),
             "w_dice": format_float(train_losses.get("w_dice", 0.0)),
             "w_ce": format_float(train_losses.get("w_ce", 0.0)),
             "w_tversky": format_float(train_losses.get("w_tversky", 0.0)),
             "w_boundary": format_float(train_losses.get("w_boundary", 0.0)),
             "w_sdf": format_float(train_losses.get("w_sdf", 0.0)),
             "w_core": format_float(train_losses.get("w_core", 0.0)),
+            "w_center": format_float(train_losses.get("w_center", 0.0)),
             "stage2_active": format_float(train_losses.get("stage2_active", 0.0)),
             "val_dice": format_float(val_metrics["dice"]),
             "val_iou": format_float(val_metrics["iou"]),
@@ -2150,6 +2283,10 @@ def main() -> None:
             "val_pred_voxels": format_float(val_metrics.get("pred_voxels", None)),
             "val_post_pred_voxels": format_float(val_metrics.get("post_pred_voxels", None)),
             "val_gt_voxels": format_float(val_metrics.get("gt_voxels", None)),
+            "val_pred_gt_ratio": format_float(val_metrics.get("pred_gt_ratio", None)),
+            "val_post_pred_gt_ratio": format_float(val_metrics.get("post_pred_gt_ratio", None)),
+            "val_threshold": format_float(threshold),
+            "val_min_voxels": min_voxels,
             "val_score": format_float(val_score),
             "epoch_time_sec": format_float(epoch_time),
         }
@@ -2159,11 +2296,20 @@ def main() -> None:
         print(
             f"Epoch {epoch:03d}/{epochs} | "
             f"loss={train_losses['total']:.5f} | "
+            f"center={train_losses.get('center', 0.0):.4f} | "
             f"w_ce={train_losses.get('w_ce', 0.0):.2f} | "
             f"w_bnd={train_losses.get('w_boundary', 0.0):.2f} | "
             f"val_dice={val_metrics['dice']:.5f} | "
+            f"val_soft={val_metrics.get('soft_dice', 0.0):.5f} | "
             f"val_post={val_metrics.get('post_dice', 0.0):.5f} | "
             f"val_iou={val_metrics['iou']:.5f} | "
+            f"pred/gt={val_metrics.get('pred_gt_ratio', 0.0):.3f} | "
+            f"pred_vox={val_metrics.get('pred_voxels', 0.0):.1f} | "
+            f"gt_vox={val_metrics.get('gt_voxels', 0.0):.1f} | "
+            f"thr={threshold:.2f} | "
+            f"min_cc={min_voxels} | "
+            f"gpu_peak={train_losses.get('peak_allocated_gb', 0.0):.1f}/"
+            f"{train_losses.get('peak_reserved_gb', 0.0):.1f}GB | "
             f"lr={current_lr:.3e} | "
             f"time={epoch_time:.1f}s{flag}"
         )
@@ -2199,7 +2345,8 @@ data:
   intensity_mode: ct        # ct / percentile
   ct_window: [-1000, 400]
   profile_ratios: [1, 1, 1, 0.5, 0.5]  # class0 negative : classes1-4 positive = 1:3
-  samples_per_volume: 8
+  samples_per_volume: 2
+  train_repeat_factor: 2
   small_cc_voxels: 128
   large_cc_voxels: 4096
   overwrite_aux: false
@@ -2212,9 +2359,12 @@ model:
   in_channels: 1
   swin_feature_channels: 16
   two_d_feature_channels: 16
+  two_d_mode: z_axis_adjacent_triplet
+  neighbor_radius: 1
   fusion_channels: 32
-  feature_size: 24
+  feature_size: 48
   use_checkpoint: true
+  use_global_position_encoding: true
 
 loss:
   warmup_epochs: 15
@@ -2230,7 +2380,11 @@ loss:
   sdf_weight_start: 0.0
   sdf_weight_end: 0.3
   core_weight_start: 0.0
-  core_weight_end: 0.3
+  core_weight_end: 0.0
+  center_weight_start: 0.0
+  center_weight_end: 0.03
+  center_source: mask
+  center_use_smooth_l1: true
   tversky_alpha: 0.3
   tversky_beta: 0.7
   boundary_voxel_boost: 5.0
@@ -2246,7 +2400,8 @@ train:
   weight_decay: 0.00001
   scheduler: cosine
   amp: true
-  grad_accum_steps: 4
+  cuda_memory_limit_gb: 24.0
+  grad_accum_steps: 8
   grad_clip_norm: 12.0
   drop_last: false
 

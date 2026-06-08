@@ -53,6 +53,7 @@ class DynamicLossWeights:
     boundary: float
     sdf: float
     core: float
+    center: float
     stage2_active: bool
 
 
@@ -96,6 +97,66 @@ def _schedule_linear(
     return float(start + (end - start) * p)
 
 
+def soft_center_loss_3d(
+    logits: torch.Tensor,
+    target: torch.Tensor,
+    eps: float = 1e-6,
+    use_smooth_l1: bool = True,
+) -> torch.Tensor:
+    """
+    Soft center-of-mass consistency loss for 3D binary foreground.
+
+    logits: [B, 1, D, H, W]
+    target: [B, 1, D, H, W] or [B, D, H, W]
+    """
+    if logits.ndim != 5:
+        raise ValueError(f"logits must be [B,C,D,H,W], got shape={tuple(logits.shape)}")
+
+    if logits.shape[1] != 1:
+        logits = logits[:, :1]
+
+    if target.ndim == 4:
+        target = target.unsqueeze(1)
+    if target.ndim != 5:
+        raise ValueError(f"target must be [B,1,D,H,W] or [B,D,H,W], got shape={tuple(target.shape)}")
+
+    if tuple(target.shape[2:]) != tuple(logits.shape[2:]):
+        target = F.interpolate(target.float(), size=logits.shape[2:], mode="nearest")
+
+    prob = torch.sigmoid(logits.float())
+    target = (target.float() > 0).float()
+
+    batch_size, _, depth, height, width = prob.shape
+    device = prob.device
+    dtype = prob.dtype
+
+    z = torch.linspace(-1.0, 1.0, depth, device=device, dtype=dtype)
+    y = torch.linspace(-1.0, 1.0, height, device=device, dtype=dtype)
+    x = torch.linspace(-1.0, 1.0, width, device=device, dtype=dtype)
+    try:
+        zz, yy, xx = torch.meshgrid(z, y, x, indexing="ij")
+    except TypeError:
+        zz, yy, xx = torch.meshgrid(z, y, x)
+    coord = torch.stack([zz, yy, xx], dim=0).view(1, 3, 1, depth, height, width)
+
+    prob_exp = prob.unsqueeze(1)
+    target_exp = target.unsqueeze(1)
+
+    pred_mass = prob_exp.sum(dim=(2, 3, 4, 5)).clamp_min(float(eps))
+    gt_mass = target_exp.sum(dim=(2, 3, 4, 5)).clamp_min(float(eps))
+
+    pred_center = (prob_exp * coord).sum(dim=(2, 3, 4, 5)) / pred_mass
+    gt_center = (target_exp * coord).sum(dim=(2, 3, 4, 5)) / gt_mass
+
+    valid = target.view(batch_size, -1).sum(dim=1) > 0
+    if not torch.any(valid):
+        return logits.new_tensor(0.0)
+
+    if use_smooth_l1:
+        return F.smooth_l1_loss(pred_center[valid], gt_center[valid], reduction="mean")
+    return F.mse_loss(pred_center[valid], gt_center[valid], reduction="mean")
+
+
 class AdaptiveDynamicSegLoss(nn.Module):
     """
     三阶段动态复合损失。
@@ -134,6 +195,10 @@ class AdaptiveDynamicSegLoss(nn.Module):
         sdf_weight_end: float = 0.3,
         core_weight_start: float = 0.0,
         core_weight_end: float = 0.3,
+        center_weight_start: float = 0.0,
+        center_weight_end: float = 0.03,
+        center_source: str = "core",
+        center_use_smooth_l1: bool = True,
         tversky_alpha: float = 0.3,
         tversky_beta: float = 0.7,
         boundary_voxel_boost: float = 5.0,
@@ -162,6 +227,10 @@ class AdaptiveDynamicSegLoss(nn.Module):
         self.sdf_weight_end = float(sdf_weight_end)
         self.core_weight_start = float(core_weight_start)
         self.core_weight_end = float(core_weight_end)
+        self.center_weight_start = float(center_weight_start)
+        self.center_weight_end = float(center_weight_end)
+        self.center_source = str(center_source).lower().strip()
+        self.center_use_smooth_l1 = bool(center_use_smooth_l1)
 
         self.tversky_alpha = float(tversky_alpha)
         self.tversky_beta = float(tversky_beta)
@@ -181,6 +250,7 @@ class AdaptiveDynamicSegLoss(nn.Module):
                 boundary=0.0,
                 sdf=0.0,
                 core=0.0,
+                center=0.0,
                 stage2_active=False,
             )
 
@@ -191,6 +261,7 @@ class AdaptiveDynamicSegLoss(nn.Module):
             boundary=_schedule_linear(epoch, self.warmup_epochs, self.max_epochs, self.boundary_weight_start, self.boundary_weight_end),
             sdf=_schedule_linear(epoch, self.warmup_epochs, self.max_epochs, self.sdf_weight_start, self.sdf_weight_end),
             core=_schedule_linear(epoch, self.warmup_epochs, self.max_epochs, self.core_weight_start, self.core_weight_end),
+            center=_schedule_linear(epoch, self.warmup_epochs, self.max_epochs, self.center_weight_start, self.center_weight_end),
             stage2_active=int(epoch) >= self.stage2_start_epoch,
         )
 
@@ -386,6 +457,23 @@ class AdaptiveDynamicSegLoss(nn.Module):
         dice = 1.0 - ((2.0 * inter + 1.0) / (denom + 1.0 + self.eps)).mean()
         return bce + dice
 
+    def _center_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        label: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.center_source in {"core", "core_logits"} and "core_logits" in outputs:
+            center_logits = outputs["core_logits"]
+        else:
+            center_logits = outputs["mask_logits"]
+
+        return soft_center_loss_3d(
+            logits=center_logits,
+            target=label,
+            eps=self.eps,
+            use_smooth_l1=self.center_use_smooth_l1,
+        )
+
     def _stage2_weight(
         self,
         batch: Dict[str, torch.Tensor],
@@ -439,6 +527,7 @@ class AdaptiveDynamicSegLoss(nn.Module):
             boundary = zero
             sdf = zero
             core = zero
+            center = zero
         else:
             tversky = self._tversky_loss(probs, target, voxel_weight)
             boundary = self._boundary_loss(
@@ -450,6 +539,7 @@ class AdaptiveDynamicSegLoss(nn.Module):
             # SDF 回归 + SDF-mask 一致性，统一受 w_sdf 控制。
             sdf = self._sdf_loss(outputs, batch) + self._sdf_mask_consistency_loss(outputs, target)
             core = self._core_loss(outputs, batch)
+            center = self._center_loss(outputs, label)
 
         total = (
             weights.dice * dice
@@ -458,6 +548,7 @@ class AdaptiveDynamicSegLoss(nn.Module):
             + weights.boundary * boundary
             + weights.sdf * sdf
             + weights.core * core
+            + weights.center * center
         )
 
         return total, {
@@ -468,12 +559,14 @@ class AdaptiveDynamicSegLoss(nn.Module):
             "boundary": boundary.detach(),
             "sdf": sdf.detach(),
             "core": core.detach(),
+            "center": center.detach(),
             "w_dice": logits.new_tensor(weights.dice),
             "w_ce": logits.new_tensor(weights.ce),
             "w_tversky": logits.new_tensor(weights.tversky),
             "w_boundary": logits.new_tensor(weights.boundary),
             "w_sdf": logits.new_tensor(weights.sdf),
             "w_core": logits.new_tensor(weights.core),
+            "w_center": logits.new_tensor(weights.center),
             "stage2_active": logits.new_tensor(1.0 if weights.stage2_active else 0.0),
         }
 

@@ -7,10 +7,10 @@ Task-Adaptive 3D Medical Segmentation Training Script
 
 适配目标：
 1. 新任务 image/label 全体积训练，例如 NIfTI / NRRD / MHA：CSV 需要 image,label 两列；
-2. 旧项目 npz patch 训练，例如 LIDC-IDRI patch：CSV 需要 npz_path 列，npz 内建议包含 image/mask/sdf/boundary/core；
+2. 旧项目 npz patch 训练，例如 LIDC-IDRI patch：CSV 需要 npz_path 列，npz 内建议包含 image/mask/boundary/dist_map；
 3. MONAI PersistentDataset 硬盘缓存；
 4. Profiled 智能切块采样：背景、普通前景、边界/难例、小连通域、大连通域按比例采样；
-5. 动态对抗损失：Warmup Dice+CE/BCE，中后期降低 Dice/CE 并拉高 Tversky、Boundary、SDF；
+5. 动态复合损失：Warmup Dice+CE/BCE，中后期降低 Dice/CE 并拉高 Tversky、Boundary；
 6. Stage2 小连通域反向加权；
 7. AMP：优先 bfloat16，回退 float16 + GradScaler；
 8. 梯度累加、梯度裁剪、checkpoint/resume；
@@ -60,6 +60,7 @@ from tqdm import tqdm
 
 try:
     from monai.data import DataLoader, PersistentDataset
+    from monai.inferers import sliding_window_inference
     from monai.transforms import (
         Compose,
         CropForegroundd,
@@ -102,20 +103,11 @@ LOG_COLUMNS = [
     "lr",
     "train_total",
     "train_dice",
-    "train_ce",
     "train_tversky",
     "train_boundary",
-    "train_sdf",
-    "train_core",
-    "train_center",
     "w_dice",
-    "w_ce",
     "w_tversky",
     "w_boundary",
-    "w_sdf",
-    "w_core",
-    "w_center",
-    "stage2_active",
     "val_dice",
     "val_iou",
     "val_soft_dice",
@@ -162,12 +154,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "intensity_mode": "ct",
         "ct_window": [-1000, 400],
         "profile_ratios": [1, 1, 1, 0.5, 0.5],
-        "samples_per_volume": 2,
-        "train_repeat_factor": 2,
+        "samples_per_volume": 1,
+        "train_repeat_factor": 1,
         "small_cc_voxels": 128,
         "large_cc_voxels": 4096,
         "overwrite_aux": False,
-        "num_workers": 4,
+        "num_workers": 2,
+        "pin_memory": False,
+        "prefetch_factor": 1,
     },
     "model": {
         "name": "hybrid_swin_sdf_core",
@@ -179,36 +173,22 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "two_d_feature_channels": 16,
         "two_d_mode": "z_axis_adjacent_triplet",
         "neighbor_radius": 1,
+        "two_d_slice_chunk_size": 8,
         "fusion_channels": 32,
         "feature_size": 48,
         "use_checkpoint": True,
         "use_global_position_encoding": True,
     },
     "loss": {
-        "warmup_epochs": 15,
-        "stage2_start_epoch": 80,
-        "dice_weight_start": 1.0,
-        "dice_weight_end": 0.35,
-        "ce_weight_start": 1.0,
-        "ce_weight_end": 0.25,
-        "tversky_weight_start": 0.0,
-        "tversky_weight_end": 1.2,
-        "boundary_weight_start": 0.0,
-        "boundary_weight_end": 0.8,
-        "sdf_weight_start": 0.0,
-        "sdf_weight_end": 0.3,
-        "core_weight_start": 0.0,
-        "core_weight_end": 0.0,
-        "center_weight_start": 0.0,
-        "center_weight_end": 0.03,
-        "center_source": "mask",
-        "center_use_smooth_l1": True,
-        "tversky_alpha": 0.3,
-        "tversky_beta": 0.7,
+        "dice_weight": 1.0,
+        "tversky_weight": 0.4,
+        "boundary_start_epoch": 40,
+        "boundary_end_epoch": 120,
+        "boundary_max_weight": 0.02,
+        "tversky_alpha": 0.6,
+        "tversky_beta": 0.4,
         "boundary_voxel_boost": 5.0,
         "dist_sigma": 0.2,
-        "stage2_weight_power": 1.0,
-        "max_stage2_weight": 8.0,
     },
     "train": {
         "epochs": 300,
@@ -218,8 +198,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "weight_decay": 0.00001,
         "scheduler": "cosine",
         "amp": True,
-        "cuda_memory_limit_gb": 24.0,
-        "grad_accum_steps": 8,
+        "cuda_memory_limit_gb": 20.0,
+        "host_memory_limit_gb": 48.0,
+        "grad_accum_steps": 4,
         "grad_clip_norm": 12.0,
         "drop_last": False,
     },
@@ -936,9 +917,8 @@ class LoadNPZPatchd(MapTransform):
     npz 内支持：
         image
         mask 或 label
-        sdf / dist_map
+        dist_map (legacy npz key "sdf" is read as dist_map)
         boundary
-        core
     """
 
     def __init__(self, npz_key: str = "npz_path") -> None:
@@ -966,14 +946,12 @@ class LoadNPZPatchd(MapTransform):
             d[LABEL_KEY] = _ensure_channel_first_np(label_arr, LABEL_KEY).astype(np.int64)
             d[MASK_ALIAS_KEY] = d[LABEL_KEY]
 
-            if "sdf" in keys:
-                d["sdf"] = _ensure_channel_first_np(npz["sdf"], "sdf").astype(np.float32)
             if "dist_map" in keys:
                 d["dist_map"] = _ensure_channel_first_np(npz["dist_map"], "dist_map").astype(np.float32)
+            elif "sdf" in keys:
+                d["dist_map"] = _ensure_channel_first_np(npz["sdf"], "sdf").astype(np.float32)
             if "boundary" in keys:
                 d["boundary"] = _ensure_channel_first_np(npz["boundary"], "boundary").astype(np.float32)
-            if "core" in keys:
-                d["core"] = _ensure_channel_first_np(npz["core"], "core").astype(np.float32)
             if "sample_label" in keys and "sample_label" not in d:
                 d["sample_label"] = float(np.asarray(npz["sample_label"]).reshape(-1)[0])
 
@@ -1015,7 +993,7 @@ class BuildAuxTargetsd(MapTransform):
         overwrite_existing: bool = False,
         small_cc_voxels: int = 128,
         large_cc_voxels: int = 4096,
-        sdf_clip: float = 20.0,
+        distance_clip: float = 20.0,
         inv_weight_alpha: float = 0.5,
         max_inv_weight: float = 8.0,
     ) -> None:
@@ -1024,7 +1002,7 @@ class BuildAuxTargetsd(MapTransform):
         self.overwrite_existing = bool(overwrite_existing)
         self.small_cc_voxels = int(small_cc_voxels)
         self.large_cc_voxels = int(large_cc_voxels)
-        self.sdf_clip = float(sdf_clip)
+        self.distance_clip = float(distance_clip)
         self.inv_weight_alpha = float(inv_weight_alpha)
         self.max_inv_weight = float(max_inv_weight)
 
@@ -1063,24 +1041,18 @@ class BuildAuxTargetsd(MapTransform):
         else:
             boundary = self._to_3d(d["boundary"]).astype(np.float32)
 
-        # ---------- signed distance map ----------
-        need_sdf = self.overwrite_existing or ("sdf" not in d and "dist_map" not in d)
-        if need_sdf:
+        # ---------- signed distance map used only as boundary-loss weighting ----------
+        need_dist_map = self.overwrite_existing or "dist_map" not in d
+        if need_dist_map:
             if np.any(fg) and np.any(~fg):
                 dist_out = distance_transform_edt(~fg)
                 dist_in = distance_transform_edt(fg)
-                sdf = dist_out - dist_in
-                sdf = np.clip(sdf, -self.sdf_clip, self.sdf_clip) / max(self.sdf_clip, 1e-6)
-                sdf = sdf.astype(np.float32)
+                dist_map = dist_out - dist_in
+                dist_map = np.clip(dist_map, -self.distance_clip, self.distance_clip) / max(self.distance_clip, 1e-6)
+                dist_map = dist_map.astype(np.float32)
             else:
-                sdf = np.zeros_like(label_np, dtype=np.float32)
-            d["sdf"] = self._add_ch(sdf, np.float32)
-            d["dist_map"] = self._add_ch(sdf, np.float32)
-        else:
-            if "dist_map" not in d and "sdf" in d:
-                d["dist_map"] = d["sdf"]
-            if "sdf" not in d and "dist_map" in d:
-                d["sdf"] = d["dist_map"]
+                dist_map = np.zeros_like(label_np, dtype=np.float32)
+            d["dist_map"] = self._add_ch(dist_map, np.float32)
 
         # ---------- connected component inverse weight ----------
         component_weight = np.ones_like(label_np, dtype=np.float32)
@@ -1117,10 +1089,6 @@ class BuildAuxTargetsd(MapTransform):
         d["component_weight"] = self._add_ch(component_weight, np.float32)
         d["sample_label"] = self._add_ch(sample_label, np.int64)
 
-        if "core" not in d:
-            # 没有 core 标签时给一个全 0，loss 会根据 outputs 是否有 core_logits 决定是否使用
-            d["core"] = self._add_ch(np.zeros_like(label_np, dtype=np.float32), np.float32)
-
         d[MASK_ALIAS_KEY] = d[LABEL_KEY]
         return d
 
@@ -1155,7 +1123,7 @@ def build_transforms(
     )
 
     if input_format == "npz_patch":
-        keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "sdf", "dist_map", "boundary", "core", "component_weight", "sample_label"]
+        keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "dist_map", "boundary", "component_weight", "sample_label"]
         spatial_keys = list(keys)
         transforms: List[Any] = [
             LoadNPZPatchd(npz_key="npz_path"),
@@ -1187,7 +1155,7 @@ def build_transforms(
     # 如果 CSV 里是 mask 列，需要在 records 里统一映射，后面 build_loaders 处理。
 
     base_keys = [IMAGE_KEY, label_source_key]
-    crop_keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "sdf", "dist_map", "boundary", "core", "component_weight", "sample_label"]
+    crop_keys = [IMAGE_KEY, LABEL_KEY, MASK_ALIAS_KEY, "dist_map", "boundary", "component_weight", "sample_label"]
 
     deterministic: List[Any] = [
         LoadImaged(keys=base_keys),
@@ -1299,7 +1267,7 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     intensity_mode = data_cfg.get("intensity_mode", "ct")
     ct_window = data_cfg.get("ct_window", [-1000.0, 400.0])
     profile_ratios = data_cfg.get("profile_ratios", [1, 1, 1, 0.5, 0.5])
-    samples_per_volume = int(data_cfg.get("samples_per_volume", 2))
+    samples_per_volume = int(data_cfg.get("samples_per_volume", 1))
     train_repeat_factor = max(int(data_cfg.get("train_repeat_factor", 1) or 1), 1)
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
@@ -1361,16 +1329,24 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     batch_size = int(train_cfg.get("batch_size", 1) or 1)
     if batch_size <= 0:
         raise ValueError(f"train.batch_size 必须大于 0，当前为 {batch_size}")
-    num_workers = int(data_cfg.get("num_workers", 4) or 0)
+    num_workers = int(data_cfg.get("num_workers", 2) or 0)
+    pin_memory = bool(data_cfg.get("pin_memory", False)) and torch.cuda.is_available()
+    loader_kwargs: Dict[str, Any] = {}
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = max(
+            int(data_cfg.get("prefetch_factor", 1) or 1),
+            1,
+        )
 
     train_loader = DataLoader(
         train_ds,
         batch_size=batch_size,
         shuffle=True,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
+        pin_memory=pin_memory,
         persistent_workers=num_workers > 0,
         drop_last=bool(train_cfg.get("drop_last", False)),
+        **loader_kwargs,
     )
 
     val_loader = DataLoader(
@@ -1378,9 +1354,10 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         batch_size=1,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
+        pin_memory=pin_memory,
+        persistent_workers=False,
         drop_last=False,
+        **loader_kwargs,
     )
 
     print(f"数据格式 input_format = {input_format}")
@@ -1459,6 +1436,7 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
                 two_d_feature_channels=int(model_cfg.get("two_d_feature_channels", 16)),
                 two_d_mode=str(model_cfg.get("two_d_mode", "z_axis_adjacent_triplet")),
                 neighbor_radius=int(model_cfg.get("neighbor_radius", 1)),
+                two_d_slice_chunk_size=int(model_cfg.get("two_d_slice_chunk_size", 8)),
                 fusion_channels=int(model_cfg.get("fusion_channels", 32)),
                 feature_size=int(model_cfg.get("feature_size", 48)),
                 use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
@@ -1496,58 +1474,29 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
 
     YAML 推荐配置：
     loss:
-      warmup_epochs: 15
-      stage2_start_epoch: 80
-      dice_weight_start: 1.0
-      dice_weight_end: 0.35
-      ce_weight_start: 1.0
-      ce_weight_end: 0.25
-      tversky_weight_start: 0.0
-      tversky_weight_end: 1.2
-      boundary_weight_start: 0.0
-      boundary_weight_end: 0.8
-      sdf_weight_start: 0.0
-      sdf_weight_end: 0.3
-      core_weight_start: 0.0
-      core_weight_end: 0.3
-      center_weight_start: 0.0
-      center_weight_end: 0.03
-      center_source: mask
-      tversky_alpha: 0.3
-      tversky_beta: 0.7
+      dice_weight: 1.0
+      tversky_weight: 0.4
+      boundary_start_epoch: 40
+      boundary_end_epoch: 120
+      boundary_max_weight: 0.02
+      tversky_alpha: 0.6
+      tversky_beta: 0.4
     """
     model_cfg = cfg.get("model", {})
-    train_cfg = cfg.get("train", {})
     loss_cfg = cfg.get("loss", {})
 
     criterion_kwargs = dict(
         num_classes=int(model_cfg.get("num_classes", 1)),
-        max_epochs=int(train_cfg.get("epochs", 300)),
-        warmup_epochs=int(loss_cfg.get("warmup_epochs", 15)),
-        stage2_start_epoch=int(loss_cfg.get("stage2_start_epoch", 80)),
         include_background=bool(loss_cfg.get("include_background", False)),
-        dice_weight_start=float(loss_cfg.get("dice_weight_start", 1.0)),
-        dice_weight_end=float(loss_cfg.get("dice_weight_end", 0.35)),
-        ce_weight_start=float(loss_cfg.get("ce_weight_start", loss_cfg.get("ce_weight", 1.0))),
-        ce_weight_end=float(loss_cfg.get("ce_weight_end", 0.25)),
-        tversky_weight_start=float(loss_cfg.get("tversky_weight_start", 0.0)),
-        tversky_weight_end=float(loss_cfg.get("tversky_weight_end", 1.2)),
-        boundary_weight_start=float(loss_cfg.get("boundary_weight_start", 0.0)),
-        boundary_weight_end=float(loss_cfg.get("boundary_weight_end", 0.8)),
-        sdf_weight_start=float(loss_cfg.get("sdf_weight_start", 0.0)),
-        sdf_weight_end=float(loss_cfg.get("sdf_weight_end", 0.3)),
-        core_weight_start=float(loss_cfg.get("core_weight_start", 0.0)),
-        core_weight_end=float(loss_cfg.get("core_weight_end", 0.3)),
-        center_weight_start=float(loss_cfg.get("center_weight_start", 0.0)),
-        center_weight_end=float(loss_cfg.get("center_weight_end", 0.03)),
-        center_source=str(loss_cfg.get("center_source", "mask")),
-        center_use_smooth_l1=bool(loss_cfg.get("center_use_smooth_l1", True)),
-        tversky_alpha=float(loss_cfg.get("tversky_alpha", 0.3)),
-        tversky_beta=float(loss_cfg.get("tversky_beta", 0.7)),
+        dice_weight=float(loss_cfg.get("dice_weight", 1.0)),
+        tversky_weight=float(loss_cfg.get("tversky_weight", 0.4)),
+        boundary_start_epoch=int(loss_cfg.get("boundary_start_epoch", 40)),
+        boundary_end_epoch=int(loss_cfg.get("boundary_end_epoch", 120)),
+        boundary_max_weight=float(loss_cfg.get("boundary_max_weight", 0.02)),
+        tversky_alpha=float(loss_cfg.get("tversky_alpha", 0.6)),
+        tversky_beta=float(loss_cfg.get("tversky_beta", 0.4)),
         boundary_voxel_boost=float(loss_cfg.get("boundary_voxel_boost", 5.0)),
         dist_sigma=float(loss_cfg.get("dist_sigma", 0.2)),
-        stage2_weight_power=float(loss_cfg.get("stage2_weight_power", 1.0)),
-        max_stage2_weight=float(loss_cfg.get("max_stage2_weight", 8.0)),
     )
     supported = set(inspect.signature(AdaptiveDynamicSegLoss.__init__).parameters)
     missing = sorted(set(criterion_kwargs) - supported)
@@ -1614,6 +1563,92 @@ def model_storage_gib(model: nn.Module) -> float:
         for tensor in list(model.parameters()) + list(model.buffers())
     )
     return float(storage_bytes) / float(1024 ** 3)
+
+
+def enforce_host_memory_limit(limit_gb: Optional[float], context: str) -> float:
+    """Stop cleanly before the process tree exhausts server RAM."""
+    if limit_gb is None or float(limit_gb) <= 0.0:
+        return 0.0
+    try:
+        import psutil
+
+        process = psutil.Process(os.getpid())
+        rss_bytes = process.memory_info().rss
+        for child in process.children(recursive=True):
+            try:
+                rss_bytes += child.memory_info().rss
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+    except (ImportError, OSError):
+        rss_bytes = 0
+        if os.name == "nt":
+            try:
+                import ctypes
+                from ctypes import wintypes
+
+                class ProcessMemoryCounters(ctypes.Structure):
+                    _fields_ = [
+                        ("cb", wintypes.DWORD),
+                        ("PageFaultCount", wintypes.DWORD),
+                        ("PeakWorkingSetSize", ctypes.c_size_t),
+                        ("WorkingSetSize", ctypes.c_size_t),
+                        ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                        ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                        ("PagefileUsage", ctypes.c_size_t),
+                        ("PeakPagefileUsage", ctypes.c_size_t),
+                    ]
+
+                counters = ProcessMemoryCounters()
+                counters.cb = ctypes.sizeof(counters)
+                get_current_process = ctypes.windll.kernel32.GetCurrentProcess
+                get_current_process.restype = wintypes.HANDLE
+                get_process_memory_info = ctypes.windll.psapi.GetProcessMemoryInfo
+                get_process_memory_info.argtypes = [
+                    wintypes.HANDLE,
+                    ctypes.POINTER(ProcessMemoryCounters),
+                    wintypes.DWORD,
+                ]
+                get_process_memory_info.restype = wintypes.BOOL
+                handle = get_current_process()
+                if get_process_memory_info(
+                    handle,
+                    ctypes.byref(counters),
+                    counters.cb,
+                ):
+                    rss_bytes = int(counters.WorkingSetSize)
+            except (AttributeError, OSError):
+                rss_bytes = 0
+        else:
+            page_size = int(os.sysconf("SC_PAGE_SIZE"))
+            pending = [os.getpid()]
+            seen = set()
+            while pending:
+                pid = pending.pop()
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                try:
+                    statm = Path(f"/proc/{pid}/statm").read_text(
+                        encoding="ascii"
+                    ).split()
+                    rss_bytes += int(statm[1]) * page_size
+                    children = Path(
+                        f"/proc/{pid}/task/{pid}/children"
+                    ).read_text(encoding="ascii").split()
+                    pending.extend(int(child_pid) for child_pid in children)
+                except (FileNotFoundError, PermissionError, IndexError, ValueError):
+                    continue
+
+    rss_gb = float(rss_bytes) / float(1024 ** 3)
+    if rss_gb > float(limit_gb):
+        raise MemoryError(
+            f"Host memory budget exceeded during {context}: "
+            f"rss={rss_gb:.2f} GB > limit={float(limit_gb):.2f} GB. "
+            "Reduce data.num_workers, data.samples_per_volume, or ROI size."
+        )
+    return rss_gb
 
 
 def build_amp_policy(device: torch.device, requested: bool = True) -> AMPPolicy:
@@ -1813,6 +1848,7 @@ def train_one_epoch(
     epoch: int,
     accum_steps: int = 1,
     grad_clip_norm: Optional[float] = None,
+    host_memory_limit_gb: Optional[float] = None,
 ) -> Dict[str, float]:
     model.train()
     optimizer.zero_grad(set_to_none=True)
@@ -1823,26 +1859,21 @@ def train_one_epoch(
     loss_sums = {
         "total": 0.0,
         "dice": 0.0,
-        "ce": 0.0,
         "tversky": 0.0,
         "boundary": 0.0,
-        "sdf": 0.0,
-        "core": 0.0,
-        "center": 0.0,
         "w_dice": 0.0,
-        "w_ce": 0.0,
         "w_tversky": 0.0,
         "w_boundary": 0.0,
-        "w_sdf": 0.0,
-        "w_core": 0.0,
-        "w_center": 0.0,
-        "stage2_active": 0.0,
     }
     count = 0
 
     progress = tqdm(loader, desc=f"Epoch {epoch} [train]", dynamic_ncols=True, leave=False)
 
     for step, batch in enumerate(progress):
+        host_rss_gb = enforce_host_memory_limit(
+            host_memory_limit_gb,
+            context=f"training epoch {epoch}, step {step}",
+        )
         batch = move_batch_to_device(batch, device)
         images = batch[IMAGE_KEY].float()
 
@@ -1878,8 +1909,7 @@ def train_one_epoch(
         postfix = {
             "loss": f"{float(loss.detach().cpu()):.4f}",
             "dice_l": f"{float(loss_dict['dice'].detach().cpu()):.4f}",
-            "ctr": f"{float(loss_dict.get('center', torch.tensor(0.0)).detach().cpu()):.4f}",
-            "w_ce": f"{float(loss_dict.get('w_ce', torch.tensor(0.0)).detach().cpu()):.3f}",
+            "w_tv": f"{float(loss_dict.get('w_tversky', torch.tensor(0.0)).detach().cpu()):.3f}",
             "w_bnd": f"{float(loss_dict.get('w_boundary', torch.tensor(0.0)).detach().cpu()):.3f}",
         }
         if device.type == "cuda":
@@ -1887,6 +1917,8 @@ def train_one_epoch(
                 f"{torch.cuda.memory_allocated(device) / (1024 ** 3):.1f}/"
                 f"{torch.cuda.memory_reserved(device) / (1024 ** 3):.1f}"
             )
+        if host_rss_gb > 0.0:
+            postfix["ram_gb"] = f"{host_rss_gb:.1f}"
         progress.set_postfix(postfix)
 
     averaged = average_loss_dict(loss_sums, count)
@@ -1908,12 +1940,21 @@ def validate(
     min_voxels: Any,
     min_volume_mm3: Any,
     keep_largest: Any,
+    host_memory_limit_gb: Optional[float] = None,
+    input_format: str = "npz_patch",
+    roi_size: Sequence[int] = (96, 96, 96),
+    sw_batch_size: int = 1,
+    overlap: float = 0.5,
 ) -> Dict[str, float]:
     model.eval()
     rows: List[Dict[str, float]] = []
 
     progress = tqdm(loader, desc="Validation", dynamic_ncols=True, leave=False)
-    for batch in progress:
+    for step, batch in enumerate(progress):
+        enforce_host_memory_limit(
+            host_memory_limit_gb,
+            context=f"validation step {step}",
+        )
         batch = move_batch_to_device(batch, device)
         images = batch[IMAGE_KEY].float()
         labels = batch.get(LABEL_KEY, batch.get(MASK_ALIAS_KEY))
@@ -1921,7 +1962,26 @@ def validate(
             raise KeyError(f"验证 batch 缺少 {LABEL_KEY}/{MASK_ALIAS_KEY} 标签字段。")
 
         with autocast_context(amp_policy):
-            outputs = model(images)
+            if input_format == "image_label":
+                def predictor(window: torch.Tensor) -> torch.Tensor:
+                    window_outputs = model(window)
+                    if isinstance(window_outputs, dict):
+                        return window_outputs["mask_logits"]
+                    return window_outputs
+
+                mask_logits = sliding_window_inference(
+                    inputs=images,
+                    roi_size=tuple(int(v) for v in roi_size),
+                    sw_batch_size=max(int(sw_batch_size), 1),
+                    predictor=predictor,
+                    overlap=float(overlap),
+                    mode="gaussian",
+                )
+                outputs = {"mask_logits": mask_logits}
+            else:
+                outputs = model(images)
+                if not isinstance(outputs, dict):
+                    outputs = {"mask_logits": outputs}
 
         logits = outputs["mask_logits"].detach().float().cpu().numpy()
         gt = labels.detach().cpu().numpy()
@@ -2116,12 +2176,14 @@ def main() -> None:
     )
     train_loader, val_loader, input_format = build_loaders(cfg)
 
+    if device.type == "cuda":
+        torch.cuda.init()
+    configure_cuda_memory_limit(device, train_cfg.get("cuda_memory_limit_gb", 20.0))
+
     model = build_model(cfg)
     print(f"Model parameter/buffer storage: {model_storage_gib(model):.3f} GiB")
-    # Let CUDA finish lazy initialization before applying a fractional cap.
     model = model.to(device)
     criterion = build_criterion(cfg).to(device)
-    configure_cuda_memory_limit(device, train_cfg.get("cuda_memory_limit_gb", 24.0))
     optimizer, scheduler = build_optimizer_and_scheduler(cfg, model)
 
     amp_policy = build_amp_policy(device, requested=bool(train_cfg.get("amp", True)))
@@ -2138,6 +2200,17 @@ def main() -> None:
     min_voxels = parse_class_dict_or_scalar(eval_cfg.get("min_voxels", 16))
     min_volume_mm3 = parse_class_dict_or_scalar(eval_cfg.get("min_volume_mm3", None))
     keep_largest = parse_class_dict_or_scalar(eval_cfg.get("keep_largest", False))
+    roi_size = data_cfg.get(
+        "roi_size",
+        data_cfg.get("patch_size", model_cfg.get("img_size", [96, 96, 96])),
+    )
+    val_sw_batch_size = max(
+        int(eval_cfg.get("val_sw_batch_size", eval_cfg.get("sw_batch_size", 1)) or 1),
+        1,
+    )
+    val_overlap = float(eval_cfg.get("overlap", eval_cfg.get("infer_overlap", 0.5)))
+    if not 0.0 <= val_overlap < 1.0:
+        raise ValueError(f"eval.overlap must be in [0, 1), got {val_overlap}")
 
     start_epoch = 1
     best_score = -1.0
@@ -2191,12 +2264,15 @@ def main() -> None:
         "dynamic_patches_per_epoch": len(train_loader.dataset) * samples_per_volume,
         "num_classes": num_classes,
         "amp": bool(train_cfg.get("amp", True)),
-        "cuda_memory_limit_gb": train_cfg.get("cuda_memory_limit_gb", 24.0),
+        "cuda_memory_limit_gb": train_cfg.get("cuda_memory_limit_gb", 20.0),
+        "host_memory_limit_gb": train_cfg.get("host_memory_limit_gb", 48.0),
         "cuda_allocator_config": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         "threshold": threshold,
         "min_voxels": min_voxels,
         "min_volume_mm3": min_volume_mm3,
         "keep_largest": keep_largest,
+        "val_sw_batch_size": val_sw_batch_size,
+        "val_overlap": val_overlap,
     }, ensure_ascii=False, indent=2))
 
     for epoch in range(start_epoch, epochs + 1):
@@ -2211,6 +2287,7 @@ def main() -> None:
             epoch=epoch,
             accum_steps=accum_steps,
             grad_clip_norm=grad_clip_norm,
+            host_memory_limit_gb=train_cfg.get("host_memory_limit_gb", 48.0),
         )
 
         val_metrics = validate(
@@ -2224,6 +2301,11 @@ def main() -> None:
             min_voxels=min_voxels,
             min_volume_mm3=min_volume_mm3,
             keep_largest=keep_largest,
+            host_memory_limit_gb=train_cfg.get("host_memory_limit_gb", 48.0),
+            input_format=input_format,
+            roi_size=roi_size,
+            sw_batch_size=val_sw_batch_size,
+            overlap=val_overlap,
         )
 
         if scheduler is not None:
@@ -2261,20 +2343,11 @@ def main() -> None:
             "lr": format_float(current_lr),
             "train_total": format_float(train_losses["total"]),
             "train_dice": format_float(train_losses["dice"]),
-            "train_ce": format_float(train_losses["ce"]),
             "train_tversky": format_float(train_losses["tversky"]),
             "train_boundary": format_float(train_losses["boundary"]),
-            "train_sdf": format_float(train_losses["sdf"]),
-            "train_core": format_float(train_losses["core"]),
-            "train_center": format_float(train_losses["center"]),
             "w_dice": format_float(train_losses.get("w_dice", 0.0)),
-            "w_ce": format_float(train_losses.get("w_ce", 0.0)),
             "w_tversky": format_float(train_losses.get("w_tversky", 0.0)),
             "w_boundary": format_float(train_losses.get("w_boundary", 0.0)),
-            "w_sdf": format_float(train_losses.get("w_sdf", 0.0)),
-            "w_core": format_float(train_losses.get("w_core", 0.0)),
-            "w_center": format_float(train_losses.get("w_center", 0.0)),
-            "stage2_active": format_float(train_losses.get("stage2_active", 0.0)),
             "val_dice": format_float(val_metrics["dice"]),
             "val_iou": format_float(val_metrics["iou"]),
             "val_soft_dice": format_float(val_metrics.get("soft_dice", None)),
@@ -2296,8 +2369,7 @@ def main() -> None:
         print(
             f"Epoch {epoch:03d}/{epochs} | "
             f"loss={train_losses['total']:.5f} | "
-            f"center={train_losses.get('center', 0.0):.4f} | "
-            f"w_ce={train_losses.get('w_ce', 0.0):.2f} | "
+            f"w_tv={train_losses.get('w_tversky', 0.0):.2f} | "
             f"w_bnd={train_losses.get('w_boundary', 0.0):.2f} | "
             f"val_dice={val_metrics['dice']:.5f} | "
             f"val_soft={val_metrics.get('soft_dice', 0.0):.5f} | "
@@ -2345,12 +2417,14 @@ data:
   intensity_mode: ct        # ct / percentile
   ct_window: [-1000, 400]
   profile_ratios: [1, 1, 1, 0.5, 0.5]  # class0 negative : classes1-4 positive = 1:3
-  samples_per_volume: 2
-  train_repeat_factor: 2
+  samples_per_volume: 1
+  train_repeat_factor: 1
   small_cc_voxels: 128
   large_cc_voxels: 4096
   overwrite_aux: false
-  num_workers: 4
+  num_workers: 2
+  pin_memory: false
+  prefetch_factor: 1
 
 model:
   name: hybrid_swin_sdf_core   # hybrid_swin_sdf_core / generic_swinunetr
@@ -2361,36 +2435,22 @@ model:
   two_d_feature_channels: 16
   two_d_mode: z_axis_adjacent_triplet
   neighbor_radius: 1
+  two_d_slice_chunk_size: 8
   fusion_channels: 32
   feature_size: 48
   use_checkpoint: true
   use_global_position_encoding: true
 
 loss:
-  warmup_epochs: 15
-  stage2_start_epoch: 80
-  dice_weight_start: 1.0
-  dice_weight_end: 0.35
-  ce_weight_start: 1.0
-  ce_weight_end: 0.25
-  tversky_weight_start: 0.0
-  tversky_weight_end: 1.2
-  boundary_weight_start: 0.0
-  boundary_weight_end: 0.8
-  sdf_weight_start: 0.0
-  sdf_weight_end: 0.3
-  core_weight_start: 0.0
-  core_weight_end: 0.0
-  center_weight_start: 0.0
-  center_weight_end: 0.03
-  center_source: mask
-  center_use_smooth_l1: true
-  tversky_alpha: 0.3
-  tversky_beta: 0.7
+  dice_weight: 1.0
+  tversky_weight: 0.4
+  boundary_start_epoch: 40
+  boundary_end_epoch: 120
+  boundary_max_weight: 0.02
+  tversky_alpha: 0.6
+  tversky_beta: 0.4
   boundary_voxel_boost: 5.0
   dist_sigma: 0.2
-  stage2_weight_power: 1.0
-  max_stage2_weight: 8.0
 
 train:
   epochs: 300
@@ -2400,8 +2460,9 @@ train:
   weight_decay: 0.00001
   scheduler: cosine
   amp: true
-  cuda_memory_limit_gb: 24.0
-  grad_accum_steps: 8
+  cuda_memory_limit_gb: 20.0
+  host_memory_limit_gb: 48.0
+  grad_accum_steps: 4
   grad_clip_norm: 12.0
   drop_last: false
 

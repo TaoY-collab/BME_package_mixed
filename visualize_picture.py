@@ -3,20 +3,20 @@
 """
 visualize_whole_ct_checkpoint.py
 
-根据 train.py 的保存路径，随机选择验证集整例 CT，
+根据 train.py 的保存路径，默认评估全部测试集整例 CT，
 加载 outputs/checkpoints/best_dice.pt 或 latest.pt，使用滑窗推理整例体积并可视化。
 
 建议放置位置：
     与 train.py 放在同一目录。
 
 常用运行：
-    python visualize_random_checkpoint.py --config configs/task_adaptive.yaml --num 3 --save-only
+    python visualize_picture.py --config configs/task_adaptive.yaml --save-only
 
 显示窗口：
-    python visualize_random_checkpoint.py --config configs/task_adaptive.yaml --num 1
+    python visualize_picture.py --config configs/task_adaptive.yaml --num 1
 
 指定 checkpoint：
-    python visualize_random_checkpoint.py --config configs/task_adaptive.yaml --ckpt outputs/checkpoints/latest.pt --num 3 --save-only
+    python visualize_picture.py --config configs/task_adaptive.yaml --ckpt outputs/checkpoints/latest.pt --save-only
 
 输出：
     1. 可视化图片：
@@ -29,6 +29,7 @@ visualize_whole_ct_checkpoint.py
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import random
 import re
@@ -42,7 +43,25 @@ from monai.data import PersistentDataset
 from monai.inferers import sliding_window_inference
 
 
-DEFAULT_VOLUME_ROOT = "/home/lembert/Desktop/BME-4/BME_package_mixed"
+DEFAULT_VOLUME_ROOT = "."
+
+CASE_METRIC_FIELDS = [
+    "index",
+    "case_id",
+    "fg_dice",
+    "fg_iou",
+    "precision",
+    "recall",
+    "tp_voxels",
+    "fp_voxels",
+    "fn_voxels",
+    "pred_voxels",
+    "gt_voxels",
+    "image_shape",
+    "threshold",
+    "png",
+    "npz",
+]
 
 
 # =========================
@@ -75,6 +94,7 @@ try:
         MASK_ALIAS_KEY,
         build_transforms,
         build_model,
+        configure_cuda_memory_limit,
         ensure_3d_label_np,
         fast_postprocess_prediction,
         infer_input_format,
@@ -103,7 +123,7 @@ except Exception as exc:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Random visualization from trained checkpoint."
+        description="Evaluate and visualize the test set from a trained checkpoint."
     )
 
     parser.add_argument(
@@ -133,26 +153,30 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--num",
         type=int,
-        default=1,
-        help="随机可视化几个验证集样本。",
+        default=0,
+        help="随机评估几个测试集样本；默认 0 表示评估全部测试集。",
+    )
+
+    parser.add_argument(
+        "--test-csv",
+        type=str,
+        default=None,
+        help="要评估的测试 CSV；默认使用 config.data.test_csv。",
     )
 
     parser.add_argument(
         "--val-csv",
         type=str,
         default=None,
-        help=(
-            "整例验证 CSV。默认使用 config.data.val_csv。"
-            "CSV 必须包含 image,label 或 image,mask；npz_path patch CSV 不支持整例 CT 可视化。"
-        ),
+        help="兼容旧命令的别名，等同于 --test-csv。",
     )
 
     parser.add_argument(
         "--volume-root",
         type=str,
-        default=DEFAULT_VOLUME_ROOT,
+        default=None,
         help=(
-            "整例 CT 所在目录。若 val.csv 是 npz_path patch 列表，脚本会从 val.csv 提取病例 ID，"
+            "整例 CT 所在目录。若 test.csv 是 npz_path patch 列表，脚本会从 test.csv 提取病例 ID，"
             "再到该目录寻找 {case_id}_img.nii.gz 和 {case_id}_mask.nii.gz。"
         ),
     )
@@ -241,8 +265,13 @@ def apply_visual_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dic
     if args.output_dir is not None:
         cfg["output"]["output_dir"] = args.output_dir
 
-    if args.val_csv is not None:
-        cfg["data"]["val_csv"] = args.val_csv
+    if getattr(args, "test_csv", None) is not None:
+        cfg["data"]["test_csv"] = args.test_csv
+        cfg["data"]["auto_split"] = False
+    elif args.val_csv is not None:
+        # Backward-compatible alias for older commands that passed --val-csv.
+        cfg["data"]["test_csv"] = args.val_csv
+        cfg["data"]["auto_split"] = False
 
     if args.volume_root is not None:
         cfg["data"]["volume_root"] = args.volume_root
@@ -255,6 +284,15 @@ def apply_visual_overrides(cfg: Dict[str, Any], args: argparse.Namespace) -> Dic
 
 def get_output_dir(cfg: Dict[str, Any]) -> Path:
     return resolve_runtime_path(cfg.get("output", {}).get("output_dir", DEFAULT_OUTPUT_DIR))
+
+
+def resolve_visual_data_path(value: Any, base_dir: Optional[Path] = None) -> Path:
+    raw = Path(str(value)).expanduser()
+    if raw.is_absolute():
+        return raw.resolve()
+    if base_dir is not None:
+        return (base_dir / raw).expanduser().resolve()
+    return resolve_runtime_path(raw).resolve()
 
 
 def resolve_checkpoint_path(cfg: Dict[str, Any], ckpt_arg: str) -> Path:
@@ -303,8 +341,21 @@ def extract_case_id(record: Dict[str, Any]) -> str:
     raise ValueError(f"无法从记录中提取病例 ID：{record}")
 
 
-def find_volume_pair(volume_root: Path, case_id: str) -> Tuple[Path, Path]:
+def find_volume_pair(
+    volume_root: Path,
+    case_id: str,
+    image_root: Optional[Path] = None,
+    label_root: Optional[Path] = None,
+) -> Tuple[Path, Path]:
+    image_search_root = image_root if image_root is not None else volume_root
+    label_search_root = label_root if label_root is not None else volume_root
     image_patterns = [
+        f"{case_id}_image.npy",
+        f"{case_id}_*_image.npy",
+        f"{case_id}_img.npy",
+        f"{case_id}_*_img.npy",
+        f"{case_id}*image*.npy",
+        f"{case_id}*img*.npy",
         f"{case_id}_img.nii.gz",
         f"{case_id}_*_img.nii.gz",
         f"{case_id}_image.nii.gz",
@@ -316,6 +367,13 @@ def find_volume_pair(volume_root: Path, case_id: str) -> Tuple[Path, Path]:
         f"{case_id}*ct*.nii.gz",
     ]
     label_patterns = [
+        f"{case_id}_label.npy",
+        f"{case_id}_*_label.npy",
+        f"{case_id}_mask.npy",
+        f"{case_id}_*_mask.npy",
+        f"{case_id}*label*.npy",
+        f"{case_id}*mask*.npy",
+        f"{case_id}*seg*.npy",
         f"{case_id}_mask.nii.gz",
         f"{case_id}_*_mask.nii.gz",
         f"{case_id}_label.nii.gz",
@@ -327,18 +385,18 @@ def find_volume_pair(volume_root: Path, case_id: str) -> Tuple[Path, Path]:
         f"{case_id}*seg*.nii.gz",
     ]
 
-    def first_match(patterns: Sequence[str], forbidden: Sequence[str] = ()) -> Optional[Path]:
+    def first_match(root: Path, patterns: Sequence[str], forbidden: Sequence[str] = ()) -> Optional[Path]:
         for pattern in patterns:
             candidates = sorted(
-                p for p in volume_root.rglob(pattern)
+                p for p in root.rglob(pattern)
                 if p.is_file() and not any(token in p.name.lower() for token in forbidden)
             )
             if candidates:
                 return candidates[0]
         return None
 
-    image = first_match(image_patterns, forbidden=("mask", "label", "seg", "dist"))
-    label = first_match(label_patterns, forbidden=("dist",))
+    image = first_match(image_search_root, image_patterns, forbidden=("mask", "label", "seg", "dist"))
+    label = first_match(label_search_root, label_patterns, forbidden=("dist",))
 
     if image is None or label is None:
         raise FileNotFoundError(
@@ -351,7 +409,12 @@ def find_volume_pair(volume_root: Path, case_id: str) -> Tuple[Path, Path]:
     return image.resolve(), label.resolve()
 
 
-def records_from_patch_csv(records: Sequence[Dict[str, Any]], volume_root: Path) -> List[Dict[str, Any]]:
+def records_from_patch_csv(
+    records: Sequence[Dict[str, Any]],
+    volume_root: Path,
+    image_root: Optional[Path] = None,
+    label_root: Optional[Path] = None,
+) -> List[Dict[str, Any]]:
     out: List[Dict[str, Any]] = []
     seen = set()
 
@@ -361,7 +424,12 @@ def records_from_patch_csv(records: Sequence[Dict[str, Any]], volume_root: Path)
             continue
         seen.add(case_id)
 
-        image, label = find_volume_pair(volume_root, case_id)
+        image, label = find_volume_pair(
+            volume_root,
+            case_id,
+            image_root=image_root,
+            label_root=label_root,
+        )
         out.append(
             {
                 "image": str(image),
@@ -374,16 +442,33 @@ def records_from_patch_csv(records: Sequence[Dict[str, Any]], volume_root: Path)
     return out
 
 
-def autodetect_volume_root(val_csv: Path) -> Optional[Path]:
+def autodetect_volume_root(
+    split_csv: Path,
+    data_root: Optional[Path] = None,
+    case_ids: Optional[Sequence[str]] = None,
+) -> Optional[Path]:
     here = Path(__file__).resolve()
-    candidates: List[Path] = [
-        Path(DEFAULT_VOLUME_ROOT),
-    ]
+    candidates: List[Path] = []
+    probe_case_ids = list(case_ids or [])[:5]
 
-    for base in [Path.cwd(), here.parent, here.parent.parent, *val_csv.parents]:
+    def add_candidate_tree(base: Path) -> None:
+        candidates.append(base)
+        candidates.append(base / "data")
+        candidates.append(base / "volumes")
         candidates.append(base / "BME_package_mixed")
+        candidates.append(base / "BME_package_mixed" / "data")
         candidates.append(base / "old1" / "processed_data")
         candidates.append(base / "processed_data")
+
+    if data_root is not None:
+        add_candidate_tree(data_root)
+        for parent in data_root.parents:
+            add_candidate_tree(parent)
+
+    for base in [Path.cwd(), here.parent, here.parent.parent, *split_csv.parents]:
+        add_candidate_tree(base)
+
+    add_candidate_tree(Path(DEFAULT_VOLUME_ROOT))
 
     seen = set()
     for candidate in candidates:
@@ -393,42 +478,88 @@ def autodetect_volume_root(val_csv: Path) -> Optional[Path]:
         seen.add(candidate)
         if not candidate.is_dir():
             continue
+        if probe_case_ids:
+            for case_id in probe_case_ids:
+                try:
+                    find_volume_pair(candidate, case_id)
+                    return candidate
+                except FileNotFoundError:
+                    pass
+            continue
         has_ready = any(candidate.glob("*.bt_ready"))
-        has_images = any(candidate.glob("*_img.nii.gz"))
+        has_images = (
+            any(candidate.glob("*_img.nii.gz"))
+            or any(candidate.glob("**/*_img.nii.gz"))
+            or any(candidate.glob("*_image.npy"))
+            or any(candidate.glob("**/*_image.npy"))
+        )
         if has_ready or has_images:
             return candidate
 
     return None
 
 
-def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDataset, str, Path]:
+def build_whole_volume_test_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDataset, str, Path]:
     data_cfg = cfg.get("data", {})
 
     data_root = resolve_runtime_path(data_cfg.get("data_root", "data"))
-    val_csv_value = data_cfg.get("val_csv", "val.csv")
+    test_csv_value = data_cfg.get("test_csv", "test.csv")
+    auto_split = bool(data_cfg.get("auto_split", False))
     use_default_split_paths = (
-        str(data_cfg.get("data_root", "data")) == "data"
-        and str(data_cfg.get("train_csv", "train.csv")) == "train.csv"
-        and str(val_csv_value) == "val.csv"
+        auto_split
+        or (
+            str(data_cfg.get("data_root", "data")) == "data"
+            and str(data_cfg.get("train_csv", "train.csv")) == "train.csv"
+            and str(data_cfg.get("val_csv", "val.csv")) == "val.csv"
+            and str(test_csv_value) == "test.csv"
+        )
     )
     if use_default_split_paths:
-        data_root, _, val_csv = resolve_split_csv_paths(data_cfg)
+        data_root, _, _ = resolve_split_csv_paths(data_cfg)
+        test_csv = resolve_path(data_cfg.get("test_csv", test_csv_value), data_root)
     else:
-        val_csv = resolve_path(val_csv_value, data_root)
+        test_csv = resolve_path(test_csv_value, data_root)
 
-    records = read_csv_records(val_csv, val_csv.parent)
+    records = read_csv_records(test_csv, test_csv.parent)
 
     input_format = infer_input_format(records, "auto")
+    volume_image_dir_value = data_cfg.get("volume_image_dir", None)
+    volume_label_dir_value = data_cfg.get("volume_label_dir", None)
+    image_root = (
+        resolve_visual_data_path(volume_image_dir_value, base_dir=data_root)
+        if volume_image_dir_value is not None
+        else None
+    )
+    label_root = (
+        resolve_visual_data_path(volume_label_dir_value, base_dir=data_root)
+        if volume_label_dir_value is not None
+        else None
+    )
     if input_format == "npz_patch":
         volume_root_value = data_cfg.get("volume_root", None)
-        if volume_root_value is None:
-            detected_volume_root = autodetect_volume_root(val_csv)
+        if (image_root is None) != (label_root is None):
+            raise ValueError("data.volume_image_dir and data.volume_label_dir must be set together.")
+        if image_root is not None and label_root is not None:
+            volume_root = data_root
+        elif volume_root_value is None:
+            case_ids: List[str] = []
+            seen_case_ids = set()
+            for record in records:
+                case_id = extract_case_id(record)
+                if case_id not in seen_case_ids:
+                    case_ids.append(case_id)
+                    seen_case_ids.add(case_id)
+            detected_volume_root = autodetect_volume_root(
+                test_csv,
+                data_root=data_root,
+                case_ids=case_ids,
+            )
             if detected_volume_root is not None:
                 volume_root = detected_volume_root
                 print(f"[AUTO VOLUME ROOT] {volume_root}")
             else:
                 raise ValueError(
-                    "val.csv 是 npz_path patch 列表。若要按验证集病例可视化整例 CT，"
+                    "test.csv 是 npz_path patch 列表。若要按测试集病例评估整例 CT，"
                     "请传入 --volume-root 指向整例 CT 目录，例如 old1/processed_data。"
                 )
         else:
@@ -441,13 +572,22 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
                 f"整例 CT 目录不存在：{volume_root}\n"
                 "请检查 --volume-root 是否指向包含 *_img.nii.gz / *_mask.nii.gz 的目录。"
             )
-        records = records_from_patch_csv(records, volume_root)
+        if image_root is not None and not image_root.is_dir():
+            raise ValueError(f"volume_image_dir does not exist: {image_root}")
+        if label_root is not None and not label_root.is_dir():
+            raise ValueError(f"volume_label_dir does not exist: {label_root}")
+        records = records_from_patch_csv(
+            records,
+            volume_root,
+            image_root=image_root,
+            label_root=label_root,
+        )
         input_format = "image_label"
     elif input_format != "image_label":
         raise ValueError(
-            "整例 CT 可视化需要验证 CSV 包含 image,label 或 image,mask 列。\n"
-            f"当前识别到 input_format={input_format}，通常表示 val.csv 仍是 npz patch 列表。\n"
-            "请提供整例验证 CSV，或在 patch val.csv 情况下传入 --volume-root。"
+            "整例 CT 评估需要测试 CSV 包含 image,label 或 image,mask 列。\n"
+            f"当前识别到 input_format={input_format}，通常表示 test.csv 仍是 npz patch 列表。\n"
+            "请提供整例测试 CSV，或在 patch test.csv 情况下传入 --volume-root。"
         )
 
     records = normalize_records_for_image_label(records)
@@ -460,10 +600,8 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
-    use_d2 = bool(data_cfg.get("use_d2", False))
-    d2_percentile = float(data_cfg.get("d2_percentile", 99.0))
 
-    val_tfms = build_transforms(
+    test_tfms = build_transforms(
         input_format="image_label",
         roi_size=roi_size,
         target_spacing=target_spacing,
@@ -475,8 +613,6 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
         is_train=False,
-        use_d2=use_d2,
-        d2_percentile=d2_percentile,
     )
 
     output_dir = get_output_dir(cfg)
@@ -487,13 +623,13 @@ def build_whole_volume_val_dataset(cfg: Dict[str, Any]) -> Tuple[PersistentDatas
     )
     cache_root.mkdir(parents=True, exist_ok=True)
 
-    val_ds = PersistentDataset(
+    test_ds = PersistentDataset(
         data=records,
-        transform=val_tfms,
-        cache_dir=cache_root / ("val_whole_volume_d2" if use_d2 else "val_whole_volume"),
+        transform=test_tfms,
+        cache_dir=cache_root / "test_whole_volume",
     )
 
-    return val_ds, input_format, val_csv
+    return test_ds, input_format, test_csv
 
 
 # =========================
@@ -657,6 +793,62 @@ def compute_fg_dice(pred: np.ndarray, gt: np.ndarray) -> float:
     if denom <= 0:
         return 1.0
     return float(2.0 * inter / denom)
+
+
+def compute_binary_case_metrics(pred: np.ndarray, gt: Optional[np.ndarray]) -> Dict[str, Any]:
+    pred_bin = np.asarray(pred) > 0
+    pred_voxels = int(pred_bin.sum())
+
+    if gt is None:
+        return {
+            "fg_dice": None,
+            "fg_iou": None,
+            "precision": None,
+            "recall": None,
+            "tp_voxels": None,
+            "fp_voxels": None,
+            "fn_voxels": None,
+            "pred_voxels": pred_voxels,
+            "gt_voxels": None,
+        }
+
+    gt_bin = np.asarray(gt) > 0
+    gt_voxels = int(gt_bin.sum())
+    tp = int(np.logical_and(pred_bin, gt_bin).sum())
+    fp = int(np.logical_and(pred_bin, ~gt_bin).sum())
+    fn = int(np.logical_and(~pred_bin, gt_bin).sum())
+
+    dice_denom = pred_voxels + gt_voxels
+    union = tp + fp + fn
+    precision_denom = tp + fp
+    recall_denom = tp + fn
+
+    return {
+        "fg_dice": 1.0 if dice_denom == 0 else float(2.0 * tp / dice_denom),
+        "fg_iou": 1.0 if union == 0 else float(tp / union),
+        "precision": 1.0 if precision_denom == 0 and gt_voxels == 0 else (0.0 if precision_denom == 0 else float(tp / precision_denom)),
+        "recall": 1.0 if recall_denom == 0 and pred_voxels == 0 else (0.0 if recall_denom == 0 else float(tp / recall_denom)),
+        "tp_voxels": tp,
+        "fp_voxels": fp,
+        "fn_voxels": fn,
+        "pred_voxels": pred_voxels,
+        "gt_voxels": gt_voxels,
+    }
+
+
+def rounded_metric(value: Any, digits: int = 6) -> Any:
+    if value is None:
+        return None
+    return round(float(value), digits)
+
+
+def write_case_metrics_csv(rows: Sequence[Dict[str, Any]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=CASE_METRIC_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in CASE_METRIC_FIELDS})
 
 
 def visualize_case(
@@ -863,16 +1055,28 @@ def main() -> None:
     print(f"[THRESHOLD] {threshold}")
     print("=" * 80)
 
-    # Build whole-volume validation data instead of the patch validation loader.
-    val_ds, input_format, val_csv = build_whole_volume_val_dataset(cfg)
+    # Build whole-volume test data instead of the patch validation loader.
+    test_ds, input_format, test_csv = build_whole_volume_test_dataset(cfg)
 
-    if len(val_ds) == 0:
-        raise RuntimeError("验证集为空，无法随机可视化。")
+    if len(test_ds) == 0:
+        raise RuntimeError("测试集为空，无法评估。")
 
     rng = random.Random(args.seed)
-    num = max(1, min(int(args.num), len(val_ds)))
-    indices = rng.sample(range(len(val_ds)), k=num)
+    requested_num = int(args.num)
+    if requested_num <= 0 or requested_num >= len(test_ds):
+        indices = list(range(len(test_ds)))
+    else:
+        indices = rng.sample(range(len(test_ds)), k=requested_num)
 
+    if device.type == "cuda":
+        torch.cuda.init()
+    configure_cuda_memory_limit(
+        device,
+        cfg.get("eval", {}).get(
+            "cuda_memory_limit_gb",
+            cfg.get("train", {}).get("cuda_memory_limit_gb", 20.0),
+        ),
+    )
     model = build_model(cfg).to(device)
     loaded_epoch, best_score = load_checkpoint(
         ckpt_path,
@@ -885,14 +1089,17 @@ def main() -> None:
 
     print(f"[LOADED] epoch={loaded_epoch}, best_score={best_score:.6f}")
     print(f"[INPUT FORMAT] {input_format}")
-    print(f"[VAL CSV] {val_csv}")
+    print(f"[TEST CSV] {test_csv}")
     print(f"[SLIDING WINDOW] sw_batch_size={args.sw_batch_size}, overlap={args.overlap}")
-    print(f"[SELECTED INDICES] {indices}")
+    print(f"[EVAL CASES] {len(indices)}/{len(test_ds)}")
+    if len(indices) < len(test_ds):
+        print(f"[SELECTED INDICES] {indices}")
 
     summary_rows = []
+    case_metrics_path = vis_dir / "test_case_metrics.csv"
 
     for index in indices:
-        item = val_ds[index]
+        item = test_ds[index]
         case_id = get_case_id(item, index)
 
         print("-" * 80)
@@ -925,9 +1132,7 @@ def main() -> None:
             plt=plt,
         )
 
-        dice = None
-        if gt_3d is not None:
-            dice = compute_fg_dice(pred_mask, gt_3d)
+        metrics = compute_binary_case_metrics(pred_mask, gt_3d)
 
         pred_npz_path = None
         if not args.no_save_npz:
@@ -948,22 +1153,92 @@ def main() -> None:
             )
             print(f"[SAVE NPZ] {pred_npz_path}")
 
-        summary_rows.append({
+        row = {
             "index": index,
             "case_id": case_id,
             "png": str(out_png),
             "npz": "" if pred_npz_path is None else str(pred_npz_path),
-            "fg_dice": None if dice is None else round(float(dice), 6),
-            "pred_voxels": int((pred_mask > 0).sum()),
-            "gt_voxels": None if gt_3d is None else int((gt_3d > 0).sum()),
-        })
+            "fg_dice": rounded_metric(metrics["fg_dice"]),
+            "fg_iou": rounded_metric(metrics["fg_iou"]),
+            "precision": rounded_metric(metrics["precision"]),
+            "recall": rounded_metric(metrics["recall"]),
+            "tp_voxels": metrics["tp_voxels"],
+            "fp_voxels": metrics["fp_voxels"],
+            "fn_voxels": metrics["fn_voxels"],
+            "pred_voxels": metrics["pred_voxels"],
+            "gt_voxels": metrics["gt_voxels"],
+            "image_shape": "x".join(str(v) for v in image_3d.shape),
+            "threshold": threshold,
+        }
+        summary_rows.append(row)
+        write_case_metrics_csv(summary_rows, case_metrics_path)
+
+        if row["fg_dice"] is None:
+            print(
+                f"[CASE RESULT] {case_id} | "
+                f"pred_voxels={row['pred_voxels']} | gt_voxels=NA"
+            )
+        else:
+            print(
+                f"[CASE RESULT] {case_id} | "
+                f"dice={row['fg_dice']:.6f} | iou={row['fg_iou']:.6f} | "
+                f"precision={row['precision']:.6f} | recall={row['recall']:.6f} | "
+                f"pred={row['pred_voxels']} | gt={row['gt_voxels']} | "
+                f"tp={row['tp_voxels']} | fp={row['fp_voxels']} | fn={row['fn_voxels']}"
+            )
+        print(f"[CASE METRICS CSV] {case_metrics_path}")
 
     summary_path = vis_dir / "visualization_summary.json"
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary_rows, f, ensure_ascii=False, indent=2)
 
+    dice_values = [
+        float(row["fg_dice"])
+        for row in summary_rows
+        if row.get("fg_dice") is not None
+    ]
+    iou_values = [
+        float(row["fg_iou"])
+        for row in summary_rows
+        if row.get("fg_iou") is not None
+    ]
+    precision_values = [
+        float(row["precision"])
+        for row in summary_rows
+        if row.get("precision") is not None
+    ]
+    recall_values = [
+        float(row["recall"])
+        for row in summary_rows
+        if row.get("recall") is not None
+    ]
+    eval_summary = {
+        "test_csv": str(test_csv),
+        "checkpoint": str(ckpt_path),
+        "case_metrics_csv": str(case_metrics_path),
+        "num_cases": len(summary_rows),
+        "threshold": threshold,
+        "mean_fg_dice": None if not dice_values else float(np.mean(dice_values)),
+        "median_fg_dice": None if not dice_values else float(np.median(dice_values)),
+        "min_fg_dice": None if not dice_values else float(np.min(dice_values)),
+        "max_fg_dice": None if not dice_values else float(np.max(dice_values)),
+        "mean_fg_iou": None if not iou_values else float(np.mean(iou_values)),
+        "mean_precision": None if not precision_values else float(np.mean(precision_values)),
+        "mean_recall": None if not recall_values else float(np.mean(recall_values)),
+    }
+    eval_summary_path = vis_dir / "test_evaluation_summary.json"
+    with eval_summary_path.open("w", encoding="utf-8") as f:
+        json.dump(eval_summary, f, ensure_ascii=False, indent=2)
+
     print("=" * 80)
     print(f"[SUMMARY] {summary_path}")
+    print(f"[CASE METRICS CSV] {case_metrics_path}")
+    print(f"[EVAL SUMMARY] {eval_summary_path}")
+    if dice_values:
+        print(
+            f"[MEAN FG DICE] {eval_summary['mean_fg_dice']:.6f} "
+            f"(n={len(dice_values)})"
+        )
     print("完成。")
 
 

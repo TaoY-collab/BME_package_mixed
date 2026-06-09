@@ -1,44 +1,46 @@
 # -*- coding: utf-8 -*-
-"""
-metrics.py
-
-Common 3D binary segmentation metrics for Hybrid-Swin-SDF-CoreNet.
-
-The evaluate.py script expects compute_all_metrics(pred, gt, spacing, threshold)
-returning:
-    dice, iou, precision, recall, hd95, assd, bf1, vol_diff
-"""
+"""Common 3D binary segmentation metrics."""
 
 from __future__ import annotations
 
-from typing import Dict, Sequence
+from typing import Dict, Sequence, Tuple
 
 import numpy as np
-from scipy.ndimage import binary_erosion, distance_transform_edt, generate_binary_structure
+from scipy.ndimage import (
+    binary_erosion,
+    distance_transform_edt,
+    generate_binary_structure,
+)
 
 
 def ensure_3d(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x)
-    if x.ndim == 5 and x.shape[0] == 1 and x.shape[1] == 1:
-        return x[0, 0]
-    if x.ndim == 4 and x.shape[0] == 1:
-        return x[0]
-    if x.ndim == 4 and x.shape[1] == 1:
-        return x[0, 0]
-    if x.ndim == 3:
-        return x
-    x = np.squeeze(x)
-    if x.ndim != 3:
-        raise ValueError(f"无法转换为 3D array，当前 shape={x.shape}")
-    return x
+    """Remove singleton batch/channel axes and return a 3D array."""
+    array = np.asarray(x)
+    squeezed = np.squeeze(array)
+    if squeezed.ndim != 3:
+        raise ValueError(
+            f"Expected a 3D mask with optional singleton axes, got shape={array.shape}"
+        )
+    return squeezed
+
+
+def _validate_spacing(spacing: Sequence[float]) -> Tuple[float, float, float]:
+    values = tuple(float(value) for value in spacing)
+    if len(values) != 3:
+        raise ValueError(f"spacing must have three values [D,H,W], got {values}")
+    if not all(np.isfinite(value) and value > 0.0 for value in values):
+        raise ValueError(f"spacing values must be finite and positive, got {values}")
+    return values
 
 
 def to_binary(x: np.ndarray, threshold: float = 0.5) -> np.ndarray:
-    return (ensure_3d(x) >= float(threshold)).astype(bool)
+    return ensure_3d(x) >= float(threshold)
 
 
 def extract_surface(mask: np.ndarray) -> np.ndarray:
-    mask = np.asarray(mask).astype(bool)
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 3:
+        raise ValueError(f"surface extraction expects a 3D mask, got {mask.shape}")
     if not np.any(mask):
         return np.zeros_like(mask, dtype=bool)
     structure = generate_binary_structure(rank=3, connectivity=1)
@@ -46,60 +48,65 @@ def extract_surface(mask: np.ndarray) -> np.ndarray:
     return mask & (~eroded)
 
 
-def surface_distances(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[float]) -> np.ndarray:
-    pred = np.asarray(pred).astype(bool)
-    gt = np.asarray(gt).astype(bool)
-
-    if not np.any(pred) or not np.any(gt):
+def directed_surface_distances(
+    source: np.ndarray,
+    target: np.ndarray,
+    spacing: Sequence[float],
+) -> np.ndarray:
+    """Distances from every source surface voxel to the target surface."""
+    source_surface = extract_surface(source)
+    target_surface = extract_surface(target)
+    if not np.any(source_surface) or not np.any(target_surface):
         return np.asarray([], dtype=np.float64)
 
-    pred_surface = extract_surface(pred)
-    gt_surface = extract_surface(gt)
+    spacing_dhw = _validate_spacing(spacing)
+    target_distance = distance_transform_edt(
+        ~target_surface,
+        sampling=spacing_dhw,
+    )
+    return np.asarray(target_distance[source_surface], dtype=np.float64)
 
-    if not np.any(pred_surface) or not np.any(gt_surface):
+
+def surface_distances(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    spacing: Sequence[float],
+) -> np.ndarray:
+    """Return concatenated bidirectional surface distances in millimeters."""
+    pred = np.asarray(pred, dtype=bool)
+    gt = np.asarray(gt, dtype=bool)
+    pred_to_gt = directed_surface_distances(pred, gt, spacing)
+    gt_to_pred = directed_surface_distances(gt, pred, spacing)
+    if pred_to_gt.size == 0 or gt_to_pred.size == 0:
         return np.asarray([], dtype=np.float64)
-
-    spacing = tuple(float(v) for v in spacing)
-
-    # distance_transform_edt samples parameter follows array axis order [D,H,W].
-    dt_gt = distance_transform_edt(~gt_surface, sampling=spacing)
-    dt_pred = distance_transform_edt(~pred_surface, sampling=spacing)
-
-    d_pred_to_gt = dt_gt[pred_surface]
-    d_gt_to_pred = dt_pred[gt_surface]
-
-    return np.concatenate([d_pred_to_gt, d_gt_to_pred]).astype(np.float64)
+    return np.concatenate([pred_to_gt, gt_to_pred])
 
 
-def boundary_f1(pred: np.ndarray, gt: np.ndarray, spacing: Sequence[float], tolerance_mm: float = 2.0) -> float:
-    pred = np.asarray(pred).astype(bool)
-    gt = np.asarray(gt).astype(bool)
+def boundary_f1(
+    pred: np.ndarray,
+    gt: np.ndarray,
+    spacing: Sequence[float],
+    tolerance_mm: float = 2.0,
+) -> float:
+    pred = np.asarray(pred, dtype=bool)
+    gt = np.asarray(gt, dtype=bool)
+    if float(tolerance_mm) < 0.0:
+        raise ValueError("tolerance_mm must be non-negative")
 
     if not np.any(pred) and not np.any(gt):
         return 1.0
     if not np.any(pred) or not np.any(gt):
         return 0.0
 
-    pred_surface = extract_surface(pred)
-    gt_surface = extract_surface(gt)
-    if not np.any(pred_surface) and not np.any(gt_surface):
-        return 1.0
-    if not np.any(pred_surface) or not np.any(gt_surface):
+    pred_to_gt = directed_surface_distances(pred, gt, spacing)
+    gt_to_pred = directed_surface_distances(gt, pred, spacing)
+    if pred_to_gt.size == 0 or gt_to_pred.size == 0:
         return 0.0
 
-    spacing = tuple(float(v) for v in spacing)
-    dt_gt = distance_transform_edt(~gt_surface, sampling=spacing)
-    dt_pred = distance_transform_edt(~pred_surface, sampling=spacing)
-
-    pred_match = dt_gt[pred_surface] <= float(tolerance_mm)
-    gt_match = dt_pred[gt_surface] <= float(tolerance_mm)
-
-    precision = float(pred_match.mean()) if pred_match.size > 0 else 0.0
-    recall = float(gt_match.mean()) if gt_match.size > 0 else 0.0
-
-    if precision + recall <= 0:
-        return 0.0
-    return 2.0 * precision * recall / (precision + recall)
+    precision = float(np.mean(pred_to_gt <= float(tolerance_mm)))
+    recall = float(np.mean(gt_to_pred <= float(tolerance_mm)))
+    denominator = precision + recall
+    return 0.0 if denominator == 0.0 else 2.0 * precision * recall / denominator
 
 
 def compute_all_metrics(
@@ -108,44 +115,74 @@ def compute_all_metrics(
     spacing: Sequence[float] = (1.0, 1.0, 1.0),
     threshold: float = 0.5,
 ) -> Dict[str, float]:
+    """
+    Compute overlap, surface, boundary, and signed volume metrics.
+
+    HD95 and ASSD are measured in millimeters. ``vol_diff`` is signed
+    ``predicted volume - ground-truth volume`` in cubic millimeters.
+    """
     pred_bin = to_binary(pred, threshold=threshold)
     gt_bin = to_binary(gt, threshold=0.5)
+    if pred_bin.shape != gt_bin.shape:
+        raise ValueError(
+            f"pred and gt must have the same shape, got {pred_bin.shape} and {gt_bin.shape}"
+        )
+    spacing_dhw = _validate_spacing(spacing)
 
-    tp = float(np.logical_and(pred_bin, gt_bin).sum())
-    fp = float(np.logical_and(pred_bin, ~gt_bin).sum())
-    fn = float(np.logical_and(~pred_bin, gt_bin).sum())
+    tp = int(np.logical_and(pred_bin, gt_bin).sum())
+    fp = int(np.logical_and(pred_bin, ~gt_bin).sum())
+    fn = int(np.logical_and(~pred_bin, gt_bin).sum())
+    pred_sum = int(pred_bin.sum())
+    gt_sum = int(gt_bin.sum())
+    union = int(np.logical_or(pred_bin, gt_bin).sum())
 
-    pred_sum = float(pred_bin.sum())
-    gt_sum = float(gt_bin.sum())
-    union = float(np.logical_or(pred_bin, gt_bin).sum())
-
-    dice = (2.0 * tp + 1.0) / (pred_sum + gt_sum + 1.0)
-    iou = (tp + 1.0) / (union + 1.0)
-    precision = (tp + 1.0) / (tp + fp + 1.0)
-    recall = (tp + 1.0) / (tp + fn + 1.0)
-
-    if pred_sum == 0.0 and gt_sum == 0.0:
+    if pred_sum == 0 and gt_sum == 0:
+        dice = 1.0
+        iou = 1.0
+        precision = 1.0
+        recall = 1.0
         hd95 = 0.0
         assd = 0.0
         bf1 = 1.0
-    elif pred_sum == 0.0 or gt_sum == 0.0:
-        hd95 = float("nan")
-        assd = float("nan")
-        bf1 = 0.0
     else:
-        dists = surface_distances(pred_bin, gt_bin, spacing=spacing)
-        if dists.size == 0:
+        dice = 2.0 * tp / float(pred_sum + gt_sum)
+        iou = tp / float(union) if union > 0 else 0.0
+        precision = tp / float(tp + fp) if tp + fp > 0 else 0.0
+        recall = tp / float(tp + fn) if tp + fn > 0 else 0.0
+
+        if pred_sum == 0 or gt_sum == 0:
             hd95 = float("nan")
             assd = float("nan")
+            bf1 = 0.0
         else:
-            hd95 = float(np.percentile(dists, 95))
-            assd = float(np.mean(dists))
-        bf1 = float(boundary_f1(pred_bin, gt_bin, spacing=spacing, tolerance_mm=2.0))
+            pred_to_gt = directed_surface_distances(
+                pred_bin,
+                gt_bin,
+                spacing_dhw,
+            )
+            gt_to_pred = directed_surface_distances(
+                gt_bin,
+                pred_bin,
+                spacing_dhw,
+            )
+            if pred_to_gt.size == 0 or gt_to_pred.size == 0:
+                hd95 = float("nan")
+                assd = float("nan")
+            else:
+                bidirectional = np.concatenate([pred_to_gt, gt_to_pred])
+                hd95 = float(np.percentile(bidirectional, 95))
+                assd = float(
+                    0.5 * (float(np.mean(pred_to_gt)) + float(np.mean(gt_to_pred)))
+                )
+            bf1 = boundary_f1(
+                pred_bin,
+                gt_bin,
+                spacing=spacing_dhw,
+                tolerance_mm=2.0,
+            )
 
-    voxel_volume = float(np.prod(np.asarray(spacing, dtype=np.float64)))
-    pred_vol = pred_sum * voxel_volume
-    gt_vol = gt_sum * voxel_volume
-    vol_diff = pred_vol - gt_vol
+    voxel_volume = float(np.prod(np.asarray(spacing_dhw, dtype=np.float64)))
+    vol_diff = float(pred_sum - gt_sum) * voxel_volume
 
     return {
         "dice": float(dice),
@@ -163,8 +200,12 @@ def nanmean_metric_dicts(rows):
     if not rows:
         return {}
     keys = rows[0].keys()
-    out = {}
+    output = {}
     for key in keys:
-        values = np.asarray([r[key] for r in rows], dtype=np.float64)
-        out[key] = float(np.nanmean(values)) if not np.all(np.isnan(values)) else float("nan")
-    return out
+        values = np.asarray([row[key] for row in rows], dtype=np.float64)
+        output[key] = (
+            float(np.nanmean(values))
+            if not np.all(np.isnan(values))
+            else float("nan")
+        )
+    return output

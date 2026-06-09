@@ -18,12 +18,14 @@ data:
   intensity_mode: ct
   ct_window: [-1000, 400]
   profile_ratios: [1, 1, 1, 0.5, 0.5]
-  samples_per_volume: 2
-  train_repeat_factor: 2
+  samples_per_volume: 1
+  train_repeat_factor: 1
   small_cc_voxels: 128
   large_cc_voxels: 4096
   overwrite_aux: false
-  num_workers: 4
+  num_workers: 2
+  pin_memory: false
+  prefetch_factor: 1
 
 model:
   name: hybrid_swin_sdf_core
@@ -35,36 +37,22 @@ model:
   two_d_feature_channels: 16
   two_d_mode: z_axis_adjacent_triplet
   neighbor_radius: 1
+  two_d_slice_chunk_size: 8
   fusion_channels: 32
   feature_size: 48
   use_checkpoint: true
   use_global_position_encoding: true
 
 loss:
-  warmup_epochs: 15
-  stage2_start_epoch: 80
-  dice_weight_start: 1.0
-  dice_weight_end: 0.35
-  ce_weight_start: 1.0
-  ce_weight_end: 0.25
-  tversky_weight_start: 0.0
-  tversky_weight_end: 1.2
-  boundary_weight_start: 0.0
-  boundary_weight_end: 0.8
-  sdf_weight_start: 0.0
-  sdf_weight_end: 0.3
-  core_weight_start: 0.0
-  core_weight_end: 0.0
-  center_weight_start: 0.0
-  center_weight_end: 0.03
-  center_source: mask
-  center_use_smooth_l1: true
-  tversky_alpha: 0.3
-  tversky_beta: 0.7
+  dice_weight: 1.0
+  tversky_weight: 0.4
+  boundary_start_epoch: 40
+  boundary_end_epoch: 120
+  boundary_max_weight: 0.02
+  tversky_alpha: 0.6
+  tversky_beta: 0.4
   boundary_voxel_boost: 5.0
   dist_sigma: 0.2
-  stage2_weight_power: 1.0
-  max_stage2_weight: 8.0
 
 train:
   epochs: 300
@@ -74,13 +62,16 @@ train:
   weight_decay: 0.00001
   scheduler: cosine
   amp: true
-  cuda_memory_limit_gb: 24.0
-  grad_accum_steps: 8
+  cuda_memory_limit_gb: 20.0
+  host_memory_limit_gb: 48.0
+  grad_accum_steps: 4
   grad_clip_norm: 12.0
   drop_last: false
 
 eval:
   threshold: 0.5
+  val_sw_batch_size: 1
+  overlap: 0.5
   spacing: [1.0, 1.0, 1.0]
   min_voxels: 16
   min_volume_mm3: null

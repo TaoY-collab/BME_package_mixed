@@ -21,9 +21,6 @@ Hybrid-Swin-SDF-CoreNet 项目的测试集评估脚本。
 - mask
 - pred_prob
 - pred_mask
-- pred_sdf
-- pred_core_prob
-- pred_core
 
 运行示例：
 python src/evaluate.py \
@@ -342,6 +339,7 @@ def build_model(cfg: Dict[str, Any]) -> HybridSwinSDFCoreNet:
         two_d_feature_channels=int(model_cfg.get("two_d_feature_channels", 16)),
         two_d_mode=str(model_cfg.get("two_d_mode", "z_axis_adjacent_triplet")),
         neighbor_radius=int(model_cfg.get("neighbor_radius", 1)),
+        two_d_slice_chunk_size=int(model_cfg.get("two_d_slice_chunk_size", 8)),
         fusion_channels=int(model_cfg.get("fusion_channels", 32)),
         feature_size=int(model_cfg.get("feature_size", 48)),
         use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
@@ -487,7 +485,7 @@ def build_test_loader(
     batch_size = int(eval_batch_size if eval_batch_size is not None else train_cfg.get("batch_size", 1))
     if input_format == "image_label":
         batch_size = 1
-    num_workers = int(data_cfg.get("num_workers", 4) or 0)
+    num_workers = int(data_cfg.get("num_workers", 2) or 0)
 
     test_dataset = PersistentDataset(
         data=records,
@@ -500,8 +498,8 @@ def build_test_loader(
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
+        pin_memory=False,
+        persistent_workers=False,
     )
 
     print(f"测试数据格式 input_format = {input_format}")
@@ -564,9 +562,6 @@ def save_prediction_npz(
     mask: np.ndarray,
     pred_prob: np.ndarray,
     pred_mask: np.ndarray,
-    pred_sdf: np.ndarray,
-    pred_core_prob: np.ndarray,
-    pred_core: np.ndarray,
 ) -> None:
     """
     保存单个样本的预测结果。
@@ -579,9 +574,6 @@ def save_prediction_npz(
         mask=mask.astype(np.float32, copy=False),
         pred_prob=pred_prob.astype(np.float32, copy=False),
         pred_mask=pred_mask.astype(np.float32, copy=False),
-        pred_sdf=pred_sdf.astype(np.float32, copy=False),
-        pred_core_prob=pred_core_prob.astype(np.float32, copy=False),
-        pred_core=pred_core.astype(np.float32, copy=False),
     )
 
 
@@ -734,18 +726,6 @@ def evaluate(
         else:
             pred_prob_batch = torch.softmax(mask_logits, dim=1)
 
-        if "sdf" in outputs:
-            pred_sdf_batch = outputs["sdf"]
-        else:
-            pred_sdf_batch = torch.zeros_like(pred_prob_batch)
-
-        if "core_logits" in outputs:
-            pred_core_prob_batch = torch.sigmoid(outputs["core_logits"])
-            pred_core_batch = (pred_core_prob_batch >= threshold).float()
-        else:
-            pred_core_prob_batch = torch.zeros_like(pred_prob_batch)
-            pred_core_batch = torch.zeros_like(pred_prob_batch)
-
         batch_size = int(images.shape[0])
 
         for i in range(batch_size):
@@ -772,10 +752,6 @@ def evaluate(
                 connectivity=3,
                 input_is_logits=True,
             ).astype(np.float32, copy=False)
-            pred_sdf_i = tensor_to_numpy(pred_sdf_batch[i])
-            pred_core_prob_i = tensor_to_numpy(pred_core_prob_batch[i])
-            pred_core_i = tensor_to_numpy(pred_core_batch[i])
-
             metrics = compute_all_metrics(
                 pred=pred_mask_i,
                 gt=mask_i,
@@ -811,9 +787,6 @@ def evaluate(
                 mask=mask_i,
                 pred_prob=pred_prob_i,
                 pred_mask=pred_mask_i,
-                pred_sdf=pred_sdf_i,
-                pred_core_prob=pred_core_prob_i,
-                pred_core=pred_core_i,
             )
             sample_index += 1
 
@@ -918,13 +891,16 @@ def main() -> None:
     sw_batch_size = int(eval_cfg.get("sw_batch_size", eval_cfg.get("val_sw_batch_size", 1)) or 1)
     overlap = float(eval_cfg.get("overlap", eval_cfg.get("infer_overlap", 0.5)))
 
+    if device.type == "cuda":
+        torch.cuda.init()
+    configure_cuda_memory_limit(
+        device,
+        eval_cfg.get("cuda_memory_limit_gb", train_cfg.get("cuda_memory_limit_gb", 20.0)),
+    )
+
     model = train_build_model(cfg)
     print(f"Model parameter/buffer storage: {model_storage_gib(model):.3f} GiB")
     model = model.to(device)
-    configure_cuda_memory_limit(
-        device,
-        eval_cfg.get("cuda_memory_limit_gb", train_cfg.get("cuda_memory_limit_gb", 24.0)),
-    )
 
     train_load_checkpoint(
         checkpoint_path,

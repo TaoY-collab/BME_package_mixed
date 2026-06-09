@@ -12,9 +12,7 @@ Hybrid-Swin-SDF-CoreNet 主模型文件。
 
 模型输出：
     {
-        "mask_logits": [B, 1, 64, 64, 64],
-        "sdf":         [B, 1, 64, 64, 64],
-        "core_logits": [B, 1, 64, 64, 64]
+        "mask_logits": [B, 1, 64, 64, 64]
     }
 
 整体结构：
@@ -25,16 +23,13 @@ Hybrid-Swin-SDF-CoreNet 主模型文件。
    使其输出 full-resolution 3D feature。
 
 2. 2D 分支：
-   使用 MultiView2DProjector 从 axial、coronal、sagittal 三视角提取 2D 纹理特征，
-   再还原成 3D feature。
+   只保留 z-axis adjacent triplet 2D texture branch，并还原成 3D feature。
 
 3. 融合模块：
-   使用 GatedFusion3D 融合 3D SwinUNETR feature 和 2D 多视角 feature。
+   使用 GatedFusion3D 融合 3D SwinUNETR feature 和 z-axis 2D feature。
 
-4. 多任务输出头：
+4. 输出头：
    - mask_head 输出 mask logits；
-   - sdf_head 输出 SDF，并通过 tanh 限制到 [-1, 1]；
-   - core_head 输出 core logits。
 """
 
 from __future__ import annotations
@@ -286,7 +281,7 @@ class GlobalPositionEncoding3D(nn.Module):
 
 
 class HybridSwinSDFCoreNet(nn.Module):
-    ARCHITECTURE_VERSION = "hybrid_swin_z_axis_2d_no_candidate_v1"
+    ARCHITECTURE_VERSION = "hybrid_swin_z_axis_2d_mask_only_v1"
     """
     Hybrid-Swin-SDF-CoreNet 主模型。
 
@@ -302,7 +297,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         SwinUNETR 输出的 full-resolution 3D feature 通道数。
 
     two_d_feature_channels:
-        三视角 2D 分支还原到 3D 后的输出通道数。
+        z-axis 2D 分支还原到 3D 后的输出通道数。
 
     fusion_channels:
         门控融合阶段使用的主特征通道数。
@@ -329,6 +324,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         use_global_position_encoding: bool = True,
         two_d_mode: str = "z_axis_adjacent_triplet",
         neighbor_radius: int = 1,
+        two_d_slice_chunk_size: int = 8,
     ) -> None:
         super().__init__()
 
@@ -342,6 +338,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         self.use_checkpoint = bool(use_checkpoint)
         self.two_d_mode = str(two_d_mode)
         self.neighbor_radius = int(neighbor_radius)
+        self.two_d_slice_chunk_size = max(int(two_d_slice_chunk_size), 1)
         self.use_global_position_encoding = bool(use_global_position_encoding)
 
         if self.in_channels <= 0:
@@ -406,6 +403,8 @@ class HybridSwinSDFCoreNet(nn.Module):
             out_channels=self.two_d_feature_channels,
             num_blocks=3,
             neighbor_radius=self.neighbor_radius,
+            slice_chunk_size=self.two_d_slice_chunk_size,
+            use_checkpoint=self.use_checkpoint,
         )
 
         self.global_position_encoding = (
@@ -420,20 +419,8 @@ class HybridSwinSDFCoreNet(nn.Module):
             channels_2d=self.two_d_feature_channels,
         )
 
-        # 三个任务输出头。
+        # Mask output head only.
         self.mask_head = PredictionHead3D(
-            in_channels=self.fusion_channels,
-            out_channels=1,
-            hidden_channels=self.fusion_channels,
-        )
-
-        self.sdf_head = PredictionHead3D(
-            in_channels=self.fusion_channels,
-            out_channels=1,
-            hidden_channels=self.fusion_channels,
-        )
-
-        self.core_head = PredictionHead3D(
             in_channels=self.fusion_channels,
             out_channels=1,
             hidden_channels=self.fusion_channels,
@@ -504,8 +491,6 @@ class HybridSwinSDFCoreNet(nn.Module):
         outputs:
             {
                 "mask_logits": [B, 1, 64, 64, 64],
-                "sdf":         [B, 1, 64, 64, 64],
-                "core_logits": [B, 1, 64, 64, 64]
             }
         """
         self._check_input(x)
@@ -529,10 +514,10 @@ class HybridSwinSDFCoreNet(nn.Module):
         if self.global_position_encoding is not None:
             f3d = f3d + self.global_position_encoding(f3d)
 
-        # 2D 三视角纹理分支。
+        # z-axis adjacent triplet 2D texture branch.
         f2d = self.projector2d(ct_x)
 
-        # 理论上 MultiView2DProjector 输出与输入尺寸一致；
+        # 理论上 ZAxisAdjacent2DProjector 输出与输入尺寸一致；
         # 这里仍然做一次保险处理。
         f2d = self._resize_to_input(
             feat=f2d,
@@ -543,33 +528,17 @@ class HybridSwinSDFCoreNet(nn.Module):
         # 2D-3D 门控融合。
         fused = self.gated_fusion(f3d=f3d, f2d=f2d)
 
-        # 三个输出头。
+        # Only the segmentation mask head remains.
         mask_logits = self.mask_head(fused)
-        sdf = torch.tanh(self.sdf_head(fused))
-        core_logits = self.core_head(fused)
-        # 再保险：确保所有输出都回到输入空间尺寸。
+        # Ensure the output returns to the input spatial size.
         mask_logits = self._resize_to_input(
             feat=mask_logits,
             target_size=target_size,
             name="mask_logits",
         )
 
-        sdf = self._resize_to_input(
-            feat=sdf,
-            target_size=target_size,
-            name="sdf",
-        )
-
-        core_logits = self._resize_to_input(
-            feat=core_logits,
-            target_size=target_size,
-            name="core_logits",
-        )
-
         outputs = {
             "mask_logits": mask_logits,
-            "sdf": sdf,
-            "core_logits": core_logits,
         }
 
         return outputs
@@ -599,7 +568,3 @@ if __name__ == "__main__":
 
     print("输入 x shape:", tuple(x.shape))
     print("mask_logits shape:", tuple(outputs["mask_logits"].shape))
-    print("sdf shape:", tuple(outputs["sdf"].shape))
-    print("core_logits shape:", tuple(outputs["core_logits"].shape))
-    print("sdf min:", float(outputs["sdf"].min()))
-    print("sdf max:", float(outputs["sdf"].max()))

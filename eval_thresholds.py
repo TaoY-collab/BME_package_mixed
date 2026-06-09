@@ -207,7 +207,7 @@ def build_eval_loader(
         cache_dir=cache_root / f"{safe_name(split_label)}_threshold_{cache_tag}",
     )
 
-    num_workers = int(data_cfg.get("num_workers", 4) or 0)
+    num_workers = int(data_cfg.get("num_workers", 2) or 0)
     batch_size = int(cfg.get("eval", {}).get("batch_size", train_cfg.get("batch_size", 1)) or 1)
     if input_format == "image_label":
         batch_size = 1
@@ -217,8 +217,8 @@ def build_eval_loader(
         batch_size=max(batch_size, 1),
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=torch.cuda.is_available(),
-        persistent_workers=num_workers > 0,
+        pin_memory=False,
+        persistent_workers=False,
         drop_last=False,
     )
 
@@ -765,7 +765,13 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_policy = train.build_amp_policy(device, requested=bool(cfg.get("train", {}).get("amp", True)))
     model = load_model(cfg, checkpoint_path, device)
-    train.configure_cuda_memory_limit(device, cfg.get("eval", {}).get("cuda_memory_limit_gb", cfg.get("train", {}).get("cuda_memory_limit_gb", 24.0)))
+    train.configure_cuda_memory_limit(
+        device,
+        cfg.get("eval", {}).get(
+            "cuda_memory_limit_gb",
+            cfg.get("train", {}).get("cuda_memory_limit_gb", 20.0),
+        ),
+    )
     data_cfg = cfg.get("data", {})
     eval_cfg = cfg.get("eval", {})
     roi_size = data_cfg.get("roi_size", data_cfg.get("patch_size", [96, 96, 96]))

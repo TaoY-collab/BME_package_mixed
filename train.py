@@ -105,9 +105,11 @@ LOG_COLUMNS = [
     "train_dice",
     "train_tversky",
     "train_boundary",
+    "train_sdf",
     "w_dice",
     "w_tversky",
     "w_boundary",
+    "w_sdf",
     "val_dice",
     "val_iou",
     "val_soft_dice",
@@ -177,7 +179,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "fusion_channels": 32,
         "feature_size": 48,
         "use_checkpoint": True,
-        "use_global_position_encoding": True,
+        "use_sdf_branch": True,
     },
     "loss": {
         "dice_weight": 1.0,
@@ -185,6 +187,9 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "boundary_start_epoch": 40,
         "boundary_end_epoch": 120,
         "boundary_max_weight": 0.02,
+        "sdf_start_epoch": 20,
+        "sdf_end_epoch": 80,
+        "sdf_max_weight": 0.1,
         "tversky_alpha": 0.6,
         "tversky_beta": 0.4,
         "boundary_voxel_boost": 5.0,
@@ -1440,12 +1445,7 @@ def build_model(cfg: Dict[str, Any]) -> nn.Module:
                 fusion_channels=int(model_cfg.get("fusion_channels", 32)),
                 feature_size=int(model_cfg.get("feature_size", 48)),
                 use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
-                use_global_position_encoding=bool(
-                    model_cfg.get(
-                        "use_global_position_encoding",
-                        model_cfg.get("use_absolute_position_encoding", True),
-                    )
-                ),
+                use_sdf_branch=bool(model_cfg.get("use_sdf_branch", True)),
             )
 
     if name in {"swinunetr", "generic_swinunetr", "swin_unetr"} or HybridSwinSDFCoreNet is None:
@@ -1493,6 +1493,9 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
         boundary_start_epoch=int(loss_cfg.get("boundary_start_epoch", 40)),
         boundary_end_epoch=int(loss_cfg.get("boundary_end_epoch", 120)),
         boundary_max_weight=float(loss_cfg.get("boundary_max_weight", 0.02)),
+        sdf_start_epoch=int(loss_cfg.get("sdf_start_epoch", 20)),
+        sdf_end_epoch=int(loss_cfg.get("sdf_end_epoch", 80)),
+        sdf_max_weight=float(loss_cfg.get("sdf_max_weight", 0.1)),
         tversky_alpha=float(loss_cfg.get("tversky_alpha", 0.6)),
         tversky_beta=float(loss_cfg.get("tversky_beta", 0.4)),
         boundary_voxel_boost=float(loss_cfg.get("boundary_voxel_boost", 5.0)),
@@ -1861,9 +1864,11 @@ def train_one_epoch(
         "dice": 0.0,
         "tversky": 0.0,
         "boundary": 0.0,
+        "sdf": 0.0,
         "w_dice": 0.0,
         "w_tversky": 0.0,
         "w_boundary": 0.0,
+        "w_sdf": 0.0,
     }
     count = 0
 
@@ -1911,6 +1916,7 @@ def train_one_epoch(
             "dice_l": f"{float(loss_dict['dice'].detach().cpu()):.4f}",
             "w_tv": f"{float(loss_dict.get('w_tversky', torch.tensor(0.0)).detach().cpu()):.3f}",
             "w_bnd": f"{float(loss_dict.get('w_boundary', torch.tensor(0.0)).detach().cpu()):.3f}",
+            "w_sdf": f"{float(loss_dict.get('w_sdf', torch.tensor(0.0)).detach().cpu()):.3f}",
         }
         if device.type == "cuda":
             postfix["gpu_gb"] = (
@@ -2345,9 +2351,11 @@ def main() -> None:
             "train_dice": format_float(train_losses["dice"]),
             "train_tversky": format_float(train_losses["tversky"]),
             "train_boundary": format_float(train_losses["boundary"]),
+            "train_sdf": format_float(train_losses["sdf"]),
             "w_dice": format_float(train_losses.get("w_dice", 0.0)),
             "w_tversky": format_float(train_losses.get("w_tversky", 0.0)),
             "w_boundary": format_float(train_losses.get("w_boundary", 0.0)),
+            "w_sdf": format_float(train_losses.get("w_sdf", 0.0)),
             "val_dice": format_float(val_metrics["dice"]),
             "val_iou": format_float(val_metrics["iou"]),
             "val_soft_dice": format_float(val_metrics.get("soft_dice", None)),
@@ -2371,6 +2379,7 @@ def main() -> None:
             f"loss={train_losses['total']:.5f} | "
             f"w_tv={train_losses.get('w_tversky', 0.0):.2f} | "
             f"w_bnd={train_losses.get('w_boundary', 0.0):.2f} | "
+            f"w_sdf={train_losses.get('w_sdf', 0.0):.2f} | "
             f"val_dice={val_metrics['dice']:.5f} | "
             f"val_soft={val_metrics.get('soft_dice', 0.0):.5f} | "
             f"val_post={val_metrics.get('post_dice', 0.0):.5f} | "
@@ -2439,7 +2448,7 @@ model:
   fusion_channels: 32
   feature_size: 48
   use_checkpoint: true
-  use_global_position_encoding: true
+  use_sdf_branch: true
 
 loss:
   dice_weight: 1.0
@@ -2447,6 +2456,9 @@ loss:
   boundary_start_epoch: 40
   boundary_end_epoch: 120
   boundary_max_weight: 0.02
+  sdf_start_epoch: 20
+  sdf_end_epoch: 80
+  sdf_max_weight: 0.1
   tversky_alpha: 0.6
   tversky_beta: 0.4
   boundary_voxel_boost: 5.0

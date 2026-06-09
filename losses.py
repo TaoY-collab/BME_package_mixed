@@ -21,6 +21,7 @@ class DynamicLossWeights:
     dice: float
     tversky: float
     boundary: float
+    sdf: float
 
 
 def _as_target_long(label: torch.Tensor) -> torch.Tensor:
@@ -67,6 +68,9 @@ class AdaptiveDynamicSegLoss(nn.Module):
         boundary_start_epoch: int = 40,
         boundary_end_epoch: int = 120,
         boundary_max_weight: float = 0.02,
+        sdf_start_epoch: int = 20,
+        sdf_end_epoch: int = 80,
+        sdf_max_weight: float = 0.1,
         tversky_alpha: float = 0.6,
         tversky_beta: float = 0.4,
         boundary_voxel_boost: float = 5.0,
@@ -81,6 +85,9 @@ class AdaptiveDynamicSegLoss(nn.Module):
         self.boundary_start_epoch = int(boundary_start_epoch)
         self.boundary_end_epoch = int(boundary_end_epoch)
         self.boundary_max_weight = float(boundary_max_weight)
+        self.sdf_start_epoch = int(sdf_start_epoch)
+        self.sdf_end_epoch = int(sdf_end_epoch)
+        self.sdf_max_weight = float(sdf_max_weight)
         self.tversky_alpha = float(tversky_alpha)
         self.tversky_beta = float(tversky_beta)
         self.boundary_voxel_boost = float(boundary_voxel_boost)
@@ -96,6 +103,12 @@ class AdaptiveDynamicSegLoss(nn.Module):
                 start_epoch=self.boundary_start_epoch,
                 end_epoch=self.boundary_end_epoch,
                 max_weight=self.boundary_max_weight,
+            ),
+            sdf=_schedule_boundary_cosine(
+                epoch=epoch,
+                start_epoch=self.sdf_start_epoch,
+                end_epoch=self.sdf_end_epoch,
+                max_weight=self.sdf_max_weight,
             ),
         )
 
@@ -208,6 +221,34 @@ class AdaptiveDynamicSegLoss(nn.Module):
         loss_map = self._bce_or_ce_map(logits, target_long)
         return (loss_map * weight).sum() / weight.sum().clamp_min(self.eps)
 
+    def _sdf_loss(
+        self,
+        outputs: Dict[str, torch.Tensor],
+        batch: Dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        sdf_pred = outputs.get("sdf", None)
+        if sdf_pred is None:
+            return outputs["mask_logits"].new_tensor(0.0)
+
+        sdf_target = batch.get("dist_map", batch.get("sdf", None))
+        if sdf_target is None:
+            return sdf_pred.new_tensor(0.0)
+        if sdf_target.ndim == 4:
+            sdf_target = sdf_target.unsqueeze(1)
+        if tuple(sdf_target.shape[2:]) != tuple(sdf_pred.shape[2:]):
+            sdf_target = F.interpolate(
+                sdf_target.float(),
+                size=sdf_pred.shape[2:],
+                mode="trilinear",
+                align_corners=False,
+            )
+
+        return F.smooth_l1_loss(
+            sdf_pred.float(),
+            sdf_target.float().clamp(-1.0, 1.0),
+            reduction="mean",
+        )
+
     def forward(
         self,
         outputs: Dict[str, torch.Tensor],
@@ -237,19 +278,23 @@ class AdaptiveDynamicSegLoss(nn.Module):
             boundary=batch.get("boundary", None),
             dist_map=batch.get("dist_map", None),
         )
+        sdf = self._sdf_loss(outputs, batch)
         total = (
             weights.dice * dice
             + weights.tversky * tversky
             + weights.boundary * boundary
+            + weights.sdf * sdf
         )
         return total, {
             "total": total.detach(),
             "dice": dice.detach(),
             "tversky": tversky.detach(),
             "boundary": boundary.detach(),
+            "sdf": sdf.detach(),
             "w_dice": logits.new_tensor(weights.dice),
             "w_tversky": logits.new_tensor(weights.tversky),
             "w_boundary": logits.new_tensor(weights.boundary),
+            "w_sdf": logits.new_tensor(weights.sdf),
         }
 
 

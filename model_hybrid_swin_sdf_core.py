@@ -12,7 +12,8 @@ Hybrid-Swin-SDF-CoreNet 主模型文件。
 
 模型输出：
     {
-        "mask_logits": [B, 1, 64, 64, 64]
+        "mask_logits": [B, 1, 64, 64, 64],
+        "sdf": [B, 1, 64, 64, 64]
     }
 
 整体结构：
@@ -244,44 +245,8 @@ class PredictionHead3D(nn.Module):
         return self.head(x)
 
 
-class GlobalPositionEncoding3D(nn.Module):
-    """Project a normalized z/y/x coordinate grid into feature channels."""
-
-    def __init__(self, channels: int) -> None:
-        super().__init__()
-        if channels <= 0:
-            raise ValueError(f"channels must be positive, got {channels}")
-
-        self.proj = nn.Conv3d(
-            in_channels=3,
-            out_channels=int(channels),
-            kernel_size=1,
-            stride=1,
-            padding=0,
-            bias=True,
-        )
-        nn.init.normal_(self.proj.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.proj.bias)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 5:
-            raise ValueError(f"x must be [B, C, D, H, W], got shape={tuple(x.shape)}")
-
-        batch_size, _, depth, height, width = x.shape
-        z = torch.linspace(-1.0, 1.0, steps=depth, device=x.device, dtype=x.dtype)
-        y = torch.linspace(-1.0, 1.0, steps=height, device=x.device, dtype=x.dtype)
-        x_coord = torch.linspace(-1.0, 1.0, steps=width, device=x.device, dtype=x.dtype)
-
-        zz = z.view(1, 1, depth, 1, 1).expand(batch_size, 1, depth, height, width)
-        yy = y.view(1, 1, 1, height, 1).expand(batch_size, 1, depth, height, width)
-        xx = x_coord.view(1, 1, 1, 1, width).expand(batch_size, 1, depth, height, width)
-        coords = torch.cat([zz, yy, xx], dim=1)
-
-        return self.proj(coords)
-
-
 class HybridSwinSDFCoreNet(nn.Module):
-    ARCHITECTURE_VERSION = "hybrid_swin_z_axis_2d_mask_only_v1"
+    ARCHITECTURE_VERSION = "hybrid_swin_z_axis_2d_mask_sdf_no_global_pos_v1"
     """
     Hybrid-Swin-SDF-CoreNet 主模型。
 
@@ -321,7 +286,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         fusion_channels: int = 32,
         feature_size: int = 48,
         use_checkpoint: bool = True,
-        use_global_position_encoding: bool = True,
+        use_sdf_branch: bool = True,
         two_d_mode: str = "z_axis_adjacent_triplet",
         neighbor_radius: int = 1,
         two_d_slice_chunk_size: int = 8,
@@ -339,7 +304,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         self.two_d_mode = str(two_d_mode)
         self.neighbor_radius = int(neighbor_radius)
         self.two_d_slice_chunk_size = max(int(two_d_slice_chunk_size), 1)
-        self.use_global_position_encoding = bool(use_global_position_encoding)
+        self.use_sdf_branch = bool(use_sdf_branch)
 
         if self.in_channels <= 0:
             raise ValueError(f"in_channels 必须大于 0，但当前为 {self.in_channels}")
@@ -407,23 +372,26 @@ class HybridSwinSDFCoreNet(nn.Module):
             use_checkpoint=self.use_checkpoint,
         )
 
-        self.global_position_encoding = (
-            GlobalPositionEncoding3D(channels=self.fusion_channels)
-            if self.use_global_position_encoding
-            else None
-        )
-
         # 2D-3D 门控融合。
         self.gated_fusion = GatedFusion3D(
             channels_3d=self.fusion_channels,
             channels_2d=self.two_d_feature_channels,
         )
 
-        # Mask output head only.
+        # Segmentation and signed-distance output heads.
         self.mask_head = PredictionHead3D(
             in_channels=self.fusion_channels,
             out_channels=1,
             hidden_channels=self.fusion_channels,
+        )
+        self.sdf_head = (
+            PredictionHead3D(
+                in_channels=self.fusion_channels,
+                out_channels=1,
+                hidden_channels=self.fusion_channels,
+            )
+            if self.use_sdf_branch
+            else None
         )
 
     def _check_input(self, x: torch.Tensor) -> None:
@@ -491,6 +459,7 @@ class HybridSwinSDFCoreNet(nn.Module):
         outputs:
             {
                 "mask_logits": [B, 1, 64, 64, 64],
+                "sdf":         [B, 1, 64, 64, 64],
             }
         """
         self._check_input(x)
@@ -511,9 +480,6 @@ class HybridSwinSDFCoreNet(nn.Module):
         # 投影到 fusion_channels。
         f3d = self.swin_feature_proj(f3d)
 
-        if self.global_position_encoding is not None:
-            f3d = f3d + self.global_position_encoding(f3d)
-
         # z-axis adjacent triplet 2D texture branch.
         f2d = self.projector2d(ct_x)
 
@@ -528,7 +494,6 @@ class HybridSwinSDFCoreNet(nn.Module):
         # 2D-3D 门控融合。
         fused = self.gated_fusion(f3d=f3d, f2d=f2d)
 
-        # Only the segmentation mask head remains.
         mask_logits = self.mask_head(fused)
         # Ensure the output returns to the input spatial size.
         mask_logits = self._resize_to_input(
@@ -540,6 +505,13 @@ class HybridSwinSDFCoreNet(nn.Module):
         outputs = {
             "mask_logits": mask_logits,
         }
+        if self.sdf_head is not None:
+            sdf = torch.tanh(self.sdf_head(fused))
+            outputs["sdf"] = self._resize_to_input(
+                feat=sdf,
+                target_size=target_size,
+                name="sdf",
+            )
 
         return outputs
 
@@ -568,3 +540,5 @@ if __name__ == "__main__":
 
     print("输入 x shape:", tuple(x.shape))
     print("mask_logits shape:", tuple(outputs["mask_logits"].shape))
+    print("sdf shape:", tuple(outputs["sdf"].shape))
+    print("sdf range:", float(outputs["sdf"].min()), float(outputs["sdf"].max()))

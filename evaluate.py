@@ -343,12 +343,7 @@ def build_model(cfg: Dict[str, Any]) -> HybridSwinSDFCoreNet:
         fusion_channels=int(model_cfg.get("fusion_channels", 32)),
         feature_size=int(model_cfg.get("feature_size", 48)),
         use_checkpoint=bool(model_cfg.get("use_checkpoint", True)),
-        use_global_position_encoding=bool(
-            model_cfg.get(
-                "use_global_position_encoding",
-                model_cfg.get("use_absolute_position_encoding", True),
-            )
-        ),
+        use_sdf_branch=bool(model_cfg.get("use_sdf_branch", True)),
     )
 
     return model

@@ -41,7 +41,7 @@ model:
   fusion_channels: 32
   feature_size: 48
   use_checkpoint: true
-  use_global_position_encoding: true
+  use_sdf_branch: true
 
 loss:
   dice_weight: 1.0
@@ -49,6 +49,9 @@ loss:
   boundary_start_epoch: 40
   boundary_end_epoch: 120
   boundary_max_weight: 0.02
+  sdf_start_epoch: 20
+  sdf_end_epoch: 80
+  sdf_max_weight: 0.1
   tversky_alpha: 0.6
   tversky_beta: 0.4
   boundary_voxel_boost: 5.0

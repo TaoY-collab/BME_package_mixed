@@ -211,6 +211,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "eval": {
         "threshold": 0.5,
+        "val_interval": 5,
         "spacing": [1.0, 1.0, 1.0],
         "min_voxels": 16,
         "min_volume_mm3": None,
@@ -1841,6 +1842,11 @@ def average_loss_dict(sum_dict: Dict[str, float], count: int) -> Dict[str, float
     return {k: float(v) / float(count) for k, v in sum_dict.items()}
 
 
+def should_run_validation(epoch: int, total_epochs: int, val_interval: int) -> bool:
+    interval = max(int(val_interval), 1)
+    return int(epoch) % interval == 0 or int(epoch) == int(total_epochs)
+
+
 def train_one_epoch(
     model: nn.Module,
     loader: DataLoader,
@@ -2202,6 +2208,7 @@ def main() -> None:
 
     num_classes = int(model_cfg.get("num_classes", 1))
     threshold = float(eval_cfg.get("threshold", 0.5))
+    val_interval = max(int(eval_cfg.get("val_interval", 5) or 5), 1)
     spacing = eval_cfg.get("spacing", data_cfg.get("target_spacing", [1.0, 1.0, 1.0]))
     min_voxels = parse_class_dict_or_scalar(eval_cfg.get("min_voxels", 16))
     min_volume_mm3 = parse_class_dict_or_scalar(eval_cfg.get("min_volume_mm3", None))
@@ -2274,6 +2281,7 @@ def main() -> None:
         "host_memory_limit_gb": train_cfg.get("host_memory_limit_gb", 48.0),
         "cuda_allocator_config": os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
         "threshold": threshold,
+        "val_interval": val_interval,
         "min_voxels": min_voxels,
         "min_volume_mm3": min_volume_mm3,
         "keep_largest": keep_largest,
@@ -2296,44 +2304,52 @@ def main() -> None:
             host_memory_limit_gb=train_cfg.get("host_memory_limit_gb", 48.0),
         )
 
-        val_metrics = validate(
-            model=model,
-            loader=val_loader,
-            device=device,
-            amp_policy=amp_policy,
-            num_classes=num_classes,
-            threshold=threshold,
-            spacing=spacing,
-            min_voxels=min_voxels,
-            min_volume_mm3=min_volume_mm3,
-            keep_largest=keep_largest,
-            host_memory_limit_gb=train_cfg.get("host_memory_limit_gb", 48.0),
-            input_format=input_format,
-            roi_size=roi_size,
-            sw_batch_size=val_sw_batch_size,
-            overlap=val_overlap,
-        )
+        should_validate = should_run_validation(epoch, epochs, val_interval)
+        val_metrics: Dict[str, float] = {}
+        if should_validate:
+            val_metrics = validate(
+                model=model,
+                loader=val_loader,
+                device=device,
+                amp_policy=amp_policy,
+                num_classes=num_classes,
+                threshold=threshold,
+                spacing=spacing,
+                min_voxels=min_voxels,
+                min_volume_mm3=min_volume_mm3,
+                keep_largest=keep_largest,
+                host_memory_limit_gb=train_cfg.get("host_memory_limit_gb", 48.0),
+                input_format=input_format,
+                roi_size=roi_size,
+                sw_batch_size=val_sw_batch_size,
+                overlap=val_overlap,
+            )
 
         if scheduler is not None:
             scheduler.step()
 
         current_lr = get_current_lr(optimizer)
         epoch_time = time.time() - t0
-        val_score = float(val_metrics.get("score", val_metrics.get("dice", 0.0)))
+        val_score = (
+            float(val_metrics.get("score", val_metrics.get("dice", 0.0)))
+            if should_validate
+            else None
+        )
 
+        improved = val_score is not None and val_score > best_score
+        if improved:
+            best_score = val_score
         save_checkpoint(
             latest_path,
             model=model,
             optimizer=optimizer,
             scheduler=scheduler,
             epoch=epoch,
-            best_score=max(best_score, val_score),
+            best_score=best_score,
             cfg=cfg,
         )
 
-        improved = val_score > best_score
         if improved:
-            best_score = val_score
             save_checkpoint(
                 best_path,
                 model=model,
@@ -2356,8 +2372,8 @@ def main() -> None:
             "w_tversky": format_float(train_losses.get("w_tversky", 0.0)),
             "w_boundary": format_float(train_losses.get("w_boundary", 0.0)),
             "w_sdf": format_float(train_losses.get("w_sdf", 0.0)),
-            "val_dice": format_float(val_metrics["dice"]),
-            "val_iou": format_float(val_metrics["iou"]),
+            "val_dice": format_float(val_metrics.get("dice", None)),
+            "val_iou": format_float(val_metrics.get("iou", None)),
             "val_soft_dice": format_float(val_metrics.get("soft_dice", None)),
             "val_post_dice": format_float(val_metrics.get("post_dice", None)),
             "val_post_iou": format_float(val_metrics.get("post_iou", None)),
@@ -2374,19 +2390,24 @@ def main() -> None:
         append_csv_log(log_path, row)
 
         flag = " *best*" if improved else ""
+        validation_summary = (
+            f"val_dice={val_metrics.get('dice', 0.0):.5f} | "
+            f"val_soft={val_metrics.get('soft_dice', 0.0):.5f} | "
+            f"val_post={val_metrics.get('post_dice', 0.0):.5f} | "
+            f"val_iou={val_metrics.get('iou', 0.0):.5f} | "
+            f"pred/gt={val_metrics.get('pred_gt_ratio', 0.0):.3f} | "
+            f"pred_vox={val_metrics.get('pred_voxels', 0.0):.1f} | "
+            f"gt_vox={val_metrics.get('gt_voxels', 0.0):.1f} | "
+            if should_validate
+            else f"validation=skipped(interval={val_interval}) | "
+        )
         print(
             f"Epoch {epoch:03d}/{epochs} | "
             f"loss={train_losses['total']:.5f} | "
             f"w_tv={train_losses.get('w_tversky', 0.0):.2f} | "
             f"w_bnd={train_losses.get('w_boundary', 0.0):.2f} | "
             f"w_sdf={train_losses.get('w_sdf', 0.0):.2f} | "
-            f"val_dice={val_metrics['dice']:.5f} | "
-            f"val_soft={val_metrics.get('soft_dice', 0.0):.5f} | "
-            f"val_post={val_metrics.get('post_dice', 0.0):.5f} | "
-            f"val_iou={val_metrics['iou']:.5f} | "
-            f"pred/gt={val_metrics.get('pred_gt_ratio', 0.0):.3f} | "
-            f"pred_vox={val_metrics.get('pred_voxels', 0.0):.1f} | "
-            f"gt_vox={val_metrics.get('gt_voxels', 0.0):.1f} | "
+            f"{validation_summary}"
             f"thr={threshold:.2f} | "
             f"min_cc={min_voxels} | "
             f"gpu_peak={train_losses.get('peak_allocated_gb', 0.0):.1f}/"
@@ -2480,6 +2501,7 @@ train:
 
 eval:
   threshold: 0.5
+  val_interval: 5
   spacing: [1.0, 1.0, 1.0]
   min_voxels: 16
   min_volume_mm3: null

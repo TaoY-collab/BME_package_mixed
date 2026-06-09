@@ -73,6 +73,7 @@ train:
 
 eval:
   threshold: 0.5
+  val_interval: 5
   val_sw_batch_size: 1
   overlap: 0.5
   spacing: [1.0, 1.0, 1.0]

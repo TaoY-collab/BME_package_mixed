@@ -13,6 +13,7 @@ data:
   sample_pos_neg_ratio: 3.0
   input_format: image_label
   cache_dir: outputs/persistent_cache
+  cache_version: sdf_size_weight_v1
   roi_size: [96, 96, 96]
   target_spacing: [1.0, 1.0, 1.0]
   intensity_mode: ct
@@ -52,6 +53,11 @@ loss:
   sdf_start_epoch: 20
   sdf_end_epoch: 80
   sdf_max_weight: 0.1
+  size_weight_enabled: true
+  size_weight_reference_diameter_mm: 10.0
+  size_weight_max: 4.0
+  size_weight_start_epoch: 0
+  size_weight_end_epoch: 20
   tversky_alpha: 0.6
   tversky_beta: 0.4
   boundary_voxel_boost: 5.0

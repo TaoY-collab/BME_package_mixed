@@ -110,6 +110,8 @@ LOG_COLUMNS = [
     "w_tversky",
     "w_boundary",
     "w_sdf",
+    "size_weight_ramp",
+    "size_weight_fg_mean",
     "val_dice",
     "val_iou",
     "val_soft_dice",
@@ -151,6 +153,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sample_pos_neg_ratio": 3.0,
         "input_format": "image_label",
         "cache_dir": "outputs/persistent_cache",
+        "cache_version": "sdf_size_weight_v1",
         "roi_size": [96, 96, 96],
         "target_spacing": [1.0, 1.0, 1.0],
         "intensity_mode": "ct",
@@ -190,6 +193,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "sdf_start_epoch": 20,
         "sdf_end_epoch": 80,
         "sdf_max_weight": 0.1,
+        "size_weight_enabled": True,
+        "size_weight_reference_diameter_mm": 10.0,
+        "size_weight_max": 4.0,
+        "size_weight_start_epoch": 0,
+        "size_weight_end_epoch": 20,
         "tversky_alpha": 0.6,
         "tversky_beta": 0.4,
         "boundary_voxel_boost": 5.0,
@@ -981,6 +989,27 @@ class EnsureMaskAliasd(MapTransform):
         return d
 
 
+def inverse_equivalent_diameter_weight(
+    volume_mm3: float,
+    reference_diameter_mm: float = 10.0,
+    max_weight: float = 4.0,
+) -> float:
+    """Return clamp(reference diameter / equivalent spherical diameter)."""
+    volume_mm3 = float(volume_mm3)
+    reference_diameter_mm = float(reference_diameter_mm)
+    max_weight = float(max_weight)
+    if volume_mm3 <= 0:
+        raise ValueError("volume_mm3 must be positive")
+    if reference_diameter_mm <= 0:
+        raise ValueError("reference_diameter_mm must be positive")
+    if max_weight < 1.0:
+        raise ValueError("max_weight must be >= 1")
+    equivalent_diameter_mm = (6.0 * volume_mm3 / math.pi) ** (1.0 / 3.0)
+    return float(
+        np.clip(reference_diameter_mm / equivalent_diameter_mm, 1.0, max_weight)
+    )
+
+
 class BuildAuxTargetsd(MapTransform):
     """
     由 label 构建 boundary / dist_map / component_weight / sample_label。
@@ -1000,8 +1029,9 @@ class BuildAuxTargetsd(MapTransform):
         small_cc_voxels: int = 128,
         large_cc_voxels: int = 4096,
         distance_clip: float = 20.0,
-        inv_weight_alpha: float = 0.5,
-        max_inv_weight: float = 8.0,
+        spacing_mm: Sequence[float] = (1.0, 1.0, 1.0),
+        size_weight_reference_diameter_mm: float = 10.0,
+        size_weight_max: float = 4.0,
     ) -> None:
         super().__init__(keys=[label_key], allow_missing_keys=False)
         self.label_key = label_key
@@ -1009,8 +1039,18 @@ class BuildAuxTargetsd(MapTransform):
         self.small_cc_voxels = int(small_cc_voxels)
         self.large_cc_voxels = int(large_cc_voxels)
         self.distance_clip = float(distance_clip)
-        self.inv_weight_alpha = float(inv_weight_alpha)
-        self.max_inv_weight = float(max_inv_weight)
+        self.spacing_mm = tuple(float(v) for v in spacing_mm)
+        if len(self.spacing_mm) != 3 or any(v <= 0 for v in self.spacing_mm):
+            raise ValueError("spacing_mm must contain three positive values")
+        self.voxel_volume_mm3 = float(np.prod(np.asarray(self.spacing_mm)))
+        self.size_weight_reference_diameter_mm = float(
+            size_weight_reference_diameter_mm
+        )
+        self.size_weight_max = float(size_weight_max)
+        if self.size_weight_reference_diameter_mm <= 0:
+            raise ValueError("size_weight_reference_diameter_mm must be positive")
+        if self.size_weight_max < 1.0:
+            raise ValueError("size_weight_max must be >= 1")
 
     @staticmethod
     def _to_3d(x: Any) -> np.ndarray:
@@ -1060,7 +1100,7 @@ class BuildAuxTargetsd(MapTransform):
                 dist_map = np.zeros_like(label_np, dtype=np.float32)
             d["dist_map"] = self._add_ch(dist_map, np.float32)
 
-        # ---------- connected component inverse weight ----------
+        # ---------- connected-component inverse equivalent-diameter weight ----------
         component_weight = np.ones_like(label_np, dtype=np.float32)
         sample_label = np.zeros_like(label_int, dtype=np.uint8)
 
@@ -1069,14 +1109,18 @@ class BuildAuxTargetsd(MapTransform):
             cc_sizes = np.bincount(cc.reshape(-1))
             cc_sizes[0] = 0
 
-            valid_sizes = cc_sizes[cc_sizes > 0]
-            ref_size = float(np.median(valid_sizes)) if valid_sizes.size > 0 else 1.0
-
             lut = np.ones_like(cc_sizes, dtype=np.float32)
             for cc_id in range(1, num_cc + 1):
-                size = max(float(cc_sizes[cc_id]), 1.0)
-                w = (ref_size / size) ** self.inv_weight_alpha
-                lut[cc_id] = np.clip(w, 1.0, self.max_inv_weight)
+                volume_mm3 = max(
+                    float(cc_sizes[cc_id]) * self.voxel_volume_mm3,
+                    self.voxel_volume_mm3,
+                )
+                weight = inverse_equivalent_diameter_weight(
+                    volume_mm3=volume_mm3,
+                    reference_diameter_mm=self.size_weight_reference_diameter_mm,
+                    max_weight=self.size_weight_max,
+                )
+                lut[cc_id] = weight
 
             component_weight = lut[cc].astype(np.float32)
             sample_label[fg] = 1
@@ -1114,6 +1158,8 @@ def build_transforms(
     small_cc_voxels: int,
     large_cc_voxels: int,
     overwrite_aux: bool,
+    size_weight_reference_diameter_mm: float,
+    size_weight_max: float,
     is_train: bool,
 ) -> Compose:
     roi_size = tuple(int(v) for v in roi_size)
@@ -1126,6 +1172,9 @@ def build_transforms(
         overwrite_existing=overwrite_aux,
         small_cc_voxels=small_cc_voxels,
         large_cc_voxels=large_cc_voxels,
+        spacing_mm=target_spacing,
+        size_weight_reference_diameter_mm=size_weight_reference_diameter_mm,
+        size_weight_max=size_weight_max,
     )
 
     if input_format == "npz_patch":
@@ -1278,6 +1327,11 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     small_cc_voxels = int(data_cfg.get("small_cc_voxels", 128))
     large_cc_voxels = int(data_cfg.get("large_cc_voxels", 4096))
     overwrite_aux = bool(data_cfg.get("overwrite_aux", False))
+    loss_cfg = cfg.get("loss", {})
+    size_weight_reference_diameter_mm = float(
+        loss_cfg.get("size_weight_reference_diameter_mm", 10.0)
+    )
+    size_weight_max = float(loss_cfg.get("size_weight_max", 4.0))
 
     train_tfms = build_transforms(
         input_format=input_format,
@@ -1290,6 +1344,8 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         small_cc_voxels=small_cc_voxels,
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
+        size_weight_reference_diameter_mm=size_weight_reference_diameter_mm,
+        size_weight_max=size_weight_max,
         is_train=True,
     )
     val_tfms = build_transforms(
@@ -1303,6 +1359,8 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
         small_cc_voxels=small_cc_voxels,
         large_cc_voxels=large_cc_voxels,
         overwrite_aux=overwrite_aux,
+        size_weight_reference_diameter_mm=size_weight_reference_diameter_mm,
+        size_weight_max=size_weight_max,
         is_train=False,
     )
 
@@ -1314,7 +1372,13 @@ def build_loaders(cfg: Dict[str, Any]) -> Tuple[DataLoader, DataLoader, str]:
     )
     ensure_dir(cache_root)
 
-    cache_tag = input_format
+    cache_version = str(
+        data_cfg.get("cache_version", "sdf_size_weight_v1")
+    ).strip()
+    cache_version = re.sub(r"[^A-Za-z0-9_.-]+", "_", cache_version)
+    if not cache_version:
+        raise ValueError("data.cache_version must not be empty")
+    cache_tag = f"{input_format}_{cache_version}"
 
     base_train_ds = PersistentDataset(
         data=train_records,
@@ -1497,6 +1561,9 @@ def build_criterion(cfg: Dict[str, Any]) -> AdaptiveDynamicSegLoss:
         sdf_start_epoch=int(loss_cfg.get("sdf_start_epoch", 20)),
         sdf_end_epoch=int(loss_cfg.get("sdf_end_epoch", 80)),
         sdf_max_weight=float(loss_cfg.get("sdf_max_weight", 0.1)),
+        size_weight_enabled=bool(loss_cfg.get("size_weight_enabled", True)),
+        size_weight_start_epoch=int(loss_cfg.get("size_weight_start_epoch", 0)),
+        size_weight_end_epoch=int(loss_cfg.get("size_weight_end_epoch", 20)),
         tversky_alpha=float(loss_cfg.get("tversky_alpha", 0.6)),
         tversky_beta=float(loss_cfg.get("tversky_beta", 0.4)),
         boundary_voxel_boost=float(loss_cfg.get("boundary_voxel_boost", 5.0)),
@@ -1875,6 +1942,8 @@ def train_one_epoch(
         "w_tversky": 0.0,
         "w_boundary": 0.0,
         "w_sdf": 0.0,
+        "size_weight_ramp": 0.0,
+        "size_weight_fg_mean": 0.0,
     }
     count = 0
 
@@ -1923,6 +1992,7 @@ def train_one_epoch(
             "w_tv": f"{float(loss_dict.get('w_tversky', torch.tensor(0.0)).detach().cpu()):.3f}",
             "w_bnd": f"{float(loss_dict.get('w_boundary', torch.tensor(0.0)).detach().cpu()):.3f}",
             "w_sdf": f"{float(loss_dict.get('w_sdf', torch.tensor(0.0)).detach().cpu()):.3f}",
+            "size_w": f"{float(loss_dict.get('size_weight_fg_mean', torch.tensor(1.0)).detach().cpu()):.3f}",
         }
         if device.type == "cuda":
             postfix["gpu_gb"] = (
@@ -2287,6 +2357,13 @@ def main() -> None:
         "keep_largest": keep_largest,
         "val_sw_batch_size": val_sw_batch_size,
         "val_overlap": val_overlap,
+        "size_weight_enabled": bool(loss_cfg.get("size_weight_enabled", True)),
+        "size_weight_reference_diameter_mm": float(
+            loss_cfg.get("size_weight_reference_diameter_mm", 10.0)
+        ),
+        "size_weight_max": float(loss_cfg.get("size_weight_max", 4.0)),
+        "size_weight_start_epoch": int(loss_cfg.get("size_weight_start_epoch", 0)),
+        "size_weight_end_epoch": int(loss_cfg.get("size_weight_end_epoch", 20)),
     }, ensure_ascii=False, indent=2))
 
     for epoch in range(start_epoch, epochs + 1):
@@ -2372,6 +2449,8 @@ def main() -> None:
             "w_tversky": format_float(train_losses.get("w_tversky", 0.0)),
             "w_boundary": format_float(train_losses.get("w_boundary", 0.0)),
             "w_sdf": format_float(train_losses.get("w_sdf", 0.0)),
+            "size_weight_ramp": format_float(train_losses.get("size_weight_ramp", 0.0)),
+            "size_weight_fg_mean": format_float(train_losses.get("size_weight_fg_mean", 1.0)),
             "val_dice": format_float(val_metrics.get("dice", None)),
             "val_iou": format_float(val_metrics.get("iou", None)),
             "val_soft_dice": format_float(val_metrics.get("soft_dice", None)),
@@ -2407,6 +2486,8 @@ def main() -> None:
             f"w_tv={train_losses.get('w_tversky', 0.0):.2f} | "
             f"w_bnd={train_losses.get('w_boundary', 0.0):.2f} | "
             f"w_sdf={train_losses.get('w_sdf', 0.0):.2f} | "
+            f"size_ramp={train_losses.get('size_weight_ramp', 0.0):.2f} | "
+            f"size_fg={train_losses.get('size_weight_fg_mean', 1.0):.2f} | "
             f"{validation_summary}"
             f"thr={threshold:.2f} | "
             f"min_cc={min_voxels} | "
